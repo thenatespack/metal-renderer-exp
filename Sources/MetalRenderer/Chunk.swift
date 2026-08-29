@@ -32,7 +32,7 @@ final class Chunk {
     let foliage: ChunkGeometry
     let water: ChunkGeometry
 
-    init(coord: ChunkCoord, size: Int, worldHeight: Int, generator: TerrainGenerator, device: MTLDevice) {
+    init(coord: ChunkCoord, size: Int, worldHeight: Int, generator: TerrainGenerator, blockEdits: BlockEdits, device: MTLDevice) {
         self.coord = coord
 
         let originX = coord.x * size
@@ -47,14 +47,29 @@ final class Chunk {
             }
         }
 
+        // One locked read for the whole chunk build, covering both this
+        // chunk's own voxels and the 1-column border used for neighbor face
+        // culling — everything after this is a plain, unlocked dictionary
+        // lookup per voxel. See BlockEdits.
+        let localEdits = blockEdits.snapshot(
+            xRange: (originX - 1)...(originX + size),
+            zRange: (originZ - 1)...(originZ + size)
+        )
+
         func voxelAt(_ x: Int, _ y: Int, _ z: Int) -> VoxelType {
             if y < 0 { return .stone }
             if y >= worldHeight { return .air }
 
+            let worldX = originX + x
+            let worldZ = originZ + z
+            if let edited = localEdits[BlockCoord(x: worldX, y: y, z: worldZ)] {
+                return edited
+            }
+
             let info = columnTable[(x + 1) + (z + 1) * tableSize]
             if y > info.height {
                 if y <= info.height + TerrainGenerator.treeSearchBand,
-                   let tree = generator.treeBlock(x: originX + x, y: y, z: originZ + z) {
+                   let tree = generator.treeBlock(x: worldX, y: y, z: worldZ) {
                     return tree
                 }
                 return y <= TerrainGenerator.seaLevel ? .water : .air

@@ -9,6 +9,8 @@ final class RendererView: MTKView {
     var inputController: InputController!
     var onEscape: (() -> Void)?
     var onToggleDebugOverlay: (() -> Void)?
+    var onBreakBlock: (() -> Void)?
+    var onPlaceBlock: (() -> Void)?
 
     private(set) var isCursorCaptured = false
 
@@ -70,5 +72,16 @@ final class RendererView: MTKView {
 
     override func rightMouseDragged(with event: NSEvent) {
         inputController.addMouseDelta(dx: Float(event.deltaX), dy: Float(event.deltaY))
+    }
+
+    // Left click breaks, right click places — a menu overlay sits above this
+    // view and intercepts hit-testing whenever one is open (see PauseMenuView),
+    // so these only ever fire during actual gameplay.
+    override func mouseDown(with event: NSEvent) {
+        onBreakBlock?()
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        onPlaceBlock?()
     }
 }

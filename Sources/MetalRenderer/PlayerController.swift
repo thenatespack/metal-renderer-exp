@@ -53,6 +53,7 @@ final class PlayerController {
     var swimUpSpeed: Float = 3.5
     var swimSinkSpeed: Float = 1.2
     var swimAcceleration: Float = 10
+    var swimHysteresis: Float = 0.2
 
     private var verticalVelocity: Float = 0
     private(set) var isGrounded = false
@@ -85,9 +86,18 @@ final class PlayerController {
             camera.pitch = Math.clamp(camera.pitch, -limit, limit)
         }
 
+        // Hysteresis, not a flat "feet below water top": the surface itself
+        // bobs (see vertex_water's wave), so a hard threshold flips swimming
+        // on and off every frame near the boundary, alternating gravity and
+        // buoyancy — a visible jitter right where the player would most
+        // often be, treading water at the surface.
         let feetY = camera.position.y - eyeHeight
         let waterTop = waterSurfaceHeight(camera.position.x, camera.position.z)
-        isSwimming = (waterTop.map { feetY < $0 }) ?? false
+        if let waterTop {
+            isSwimming = isSwimming ? feetY < waterTop + swimHysteresis : feetY < waterTop - swimHysteresis
+        } else {
+            isSwimming = false
+        }
 
         let flatFront = SIMD3<Float>(sin(camera.yaw), 0, -cos(camera.yaw))
         let flatRight = SIMD3<Float>(cos(camera.yaw), 0, sin(camera.yaw))

@@ -105,8 +105,17 @@ enum Shaders {
     }
 
     fragment float4 fragment_water(VertexOut in [[stage_in]],
-                                    constant Uniforms &uniforms [[buffer(1)]]) {
-        float3 normal = normalize(in.normal);
+                                    constant Uniforms &uniforms [[buffer(1)]],
+                                    bool isFrontFace [[front_facing]]) {
+        // Water is drawn with culling off (see Renderer) so the surface still
+        // renders as a visible ceiling when seen from underwater, and the
+        // shoreline/lakebed depth walls read as an enclosure when swimming
+        // inside one instead of just their single outward-facing side. Every
+        // face's stored normal only describes its "front"; on a back-facing
+        // fragment it has to be flipped before lighting, or that whole
+        // backside renders using a normal pointing the wrong way — mostly
+        // shadowed/near-black regardless of the actual light direction.
+        float3 normal = normalize(in.normal) * (isFrontFace ? 1.0 : -1.0);
         float3 shaded = shadeAndFog(in.color, normal, in.worldPosition, uniforms, 0.35);
 
         float3 viewDir = normalize(uniforms.cameraPosition - in.worldPosition);

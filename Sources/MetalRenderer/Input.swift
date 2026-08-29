@@ -8,6 +8,8 @@ enum KeyCode {
     static let c: UInt16 = 8
     static let h: UInt16 = 4
     static let escape: UInt16 = 53
+    // Standard ANSI number-row codes — not sequential, so listed explicitly.
+    static let digits: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28, 25] // 1...9
 }
 
 /// Tracks currently-held keys, modifier state, and accumulated mouse-drag deltas.

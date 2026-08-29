@@ -23,6 +23,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     let camera: Camera
     private let playerController: PlayerController
     private let isSolidAt: (Float, Float, Float) -> Bool
+    private let waterSurfaceHeight: (Float, Float) -> Float?
+    private let blockEdits = BlockEdits()
+    let hotbar = Hotbar()
     private var lastFrameTime = CACurrentMediaTime()
     private var elapsedTime: Float = 0
 
@@ -30,6 +33,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     /// Called once a second (see logBenchmark) with a formatted multi-line
     /// stats string, for the debug overlay (H) to display.
     var onStatsUpdate: ((String) -> Void)?
+    /// Called every frame with the hotbar's current selected index, for
+    /// HotbarView to highlight.
+    var onHotbarSelectionChanged: ((Int) -> Void)?
 
     private var aspectRatio: Float = 1
 
@@ -43,6 +49,17 @@ final class Renderer: NSObject, MTKViewDelegate {
     // Tuned to roughly mask the chunk load/unload boundary (loadRadius * chunkSize)
     // in ChunkManager, so streaming pop-in happens mostly hidden in fog.
     private let fogDistance: Float = 170
+
+    // Swapped in for fogColor/fogDistance whenever the camera's own eye
+    // position is underwater — reuses the existing fog machinery (every
+    // fragment shader already mixes toward uniforms.fogColor at
+    // uniforms.fogDistance) rather than needing a separate underwater shader
+    // path, so the whole view reads as murky/short-range without any
+    // per-material special-casing.
+    private let underwaterFogColor = SIMD3<Float>(0.05, 0.22, 0.40)
+    private let underwaterFogDistance: Float = 18
+    private let underwaterHysteresis: Float = 0.2
+    private var isCameraUnderwater = false
     private let farPlane: Float = 400
 
     init(device: MTLDevice, inputController: InputController) {
@@ -129,7 +146,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         let chunkSize = 16
         let seed = UInt64.random(in: 0...UInt64.max)
         let generator = TerrainGenerator(seed: seed, worldHeight: worldHeight)
-        self.chunkManager = ChunkManager(device: device, generator: generator, chunkSize: chunkSize, worldHeight: worldHeight)
+        let blockEdits = self.blockEdits
+        self.chunkManager = ChunkManager(device: device, generator: generator, blockEdits: blockEdits, chunkSize: chunkSize, worldHeight: worldHeight)
 
         for _ in 0..<maxBuffersInFlight {
             guard let buffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: .storageModeShared) else {
@@ -138,59 +156,80 @@ final class Renderer: NSObject, MTKViewDelegate {
             uniformBuffers.append(buffer)
         }
 
+        // The single source of truth for "what's actually at this world
+        // coordinate": a player edit if there is one, else whatever
+        // TerrainGenerator would put there. Every collision/raycast query
+        // below is built on this, so breaking/placing a block is always
+        // immediately reflected in physics, not just in the mesh.
+        func blockAt(_ x: Int, _ y: Int, _ z: Int) -> VoxelType {
+            if let edited = blockEdits.get(BlockCoord(x: x, y: y, z: z)) {
+                return edited
+            }
+            return generator.proceduralBlock(x: x, y: y, z: z, worldHeight: worldHeight)
+        }
+
         // The real solid terrain surface — no sea-level clamping, since
         // PlayerController's swimming physics needs to know how deep a
         // lakebed actually is, not just that it's underwater. +1 because a
         // solid voxel at index `height` spans world y in [height, height+1]
         // (see VoxelMesher/cubeCorners) — the walkable surface is its top
         // face, not the voxel's own coordinate.
+        //
+        // Fast path when nobody's edited this column: the O(1) procedural
+        // answer, same as before edits existed at all. Only a column that
+        // actually has edits pays for scanning down from the higher of the
+        // procedural height or the highest edit to find the true topmost
+        // solid block — bounded by how far the player has actually built,
+        // not by worldHeight.
         let groundHeight: (Float, Float) -> Float = { x, z in
-            let info = generator.columnInfo(x: Int(x.rounded(.down)), z: Int(z.rounded(.down)))
-            return Float(info.height + 1)
+            let ix = Int(x.rounded(.down))
+            let iz = Int(z.rounded(.down))
+            let proceduralHeight = generator.columnInfo(x: ix, z: iz).height
+            guard let editRange = blockEdits.editedYRange(x: ix, z: iz) else {
+                return Float(proceduralHeight + 1)
+            }
+            let top = max(proceduralHeight, editRange.upperBound) + 1
+            let bottom = min(proceduralHeight, editRange.lowerBound) - 1
+            var y = top
+            while y >= bottom {
+                if blockAt(ix, y, iz).isSolid { return Float(y + 1) }
+                y -= 1
+            }
+            return Float(bottom + 1)
         }
 
         // The water surface height at this column, or nil if it's dry. A
         // column is wet only when its terrain sits strictly below sea level —
         // matching the actual water-fill condition in Chunk.voxelAt, not an
-        // off-by-one loose version of it.
+        // off-by-one loose version of it. Water itself isn't editable, so
+        // this stays purely procedural.
         let waterSurfaceHeight: (Float, Float) -> Float? = { x, z in
             let info = generator.columnInfo(x: Int(x.rounded(.down)), z: Int(z.rounded(.down)))
             return info.height < TerrainGenerator.seaLevel ? Float(TerrainGenerator.seaLevel + 1) : nil
         }
 
-        // Ground height alone doesn't see vertical obstacles like trees (they
-        // don't raise the column's terrain height, they're an overlay — see
-        // TerrainGenerator.treeBlock), so this checks separately whether any
-        // solid tree block — trunk or leaves — occupies the player's own body
-        // height above this column's ground. Only that band, not the whole
-        // tree — a trunk/canopy well above head height shouldn't block
-        // walking through a clear gap underneath it.
+        // Ground height alone doesn't see vertical obstacles that don't
+        // affect terrain elevation — a tree, or a block the player placed at
+        // head height. This checks separately whether anything solid
+        // occupies the player's own body height above this column's ground.
+        // Only that band, not all the way up — something well above head
+        // height shouldn't block walking through a clear gap underneath it.
         let playerBodyHeightBlocks = 2 // matches PlayerController.eyeHeight (1.75), rounded up
         let isObstructed: (Float, Float) -> Bool = { x, z in
             let ix = Int(x.rounded(.down))
             let iz = Int(z.rounded(.down))
-            let base = generator.columnInfo(x: ix, z: iz).height
-            for y in (base + 1)...(base + playerBodyHeightBlocks) {
-                if let tree = generator.treeBlock(x: ix, y: y, z: iz), tree.isSolid {
-                    return true
-                }
+            let surfaceTop = Int(groundHeight(x, z))
+            for y in surfaceTop..<(surfaceTop + playerBodyHeightBlocks) {
+                if blockAt(ix, y, iz).isSolid { return true }
             }
             return false
         }
 
         // General point-in-solid query, used by the third-person camera to
-        // stop short of clipping through terrain or trees behind the player.
+        // stop short of clipping through terrain/trees/placed blocks behind
+        // the player, and by the break/place raycast to find a target.
         let isSolidAt: (Float, Float, Float) -> Bool = { x, y, z in
-            let ix = Int(x.rounded(.down))
-            let iy = Int(y.rounded(.down))
-            let iz = Int(z.rounded(.down))
-            let info = generator.columnInfo(x: ix, z: iz)
-            if iy <= info.height { return true }
-            if iy <= info.height + TerrainGenerator.treeSearchBand,
-               let tree = generator.treeBlock(x: ix, y: iy, z: iz) {
-                return tree.isSolid
-            }
-            return false
+            blockAt(Int(x.rounded(.down)), Int(y.rounded(.down)), Int(z.rounded(.down))).isSolid
         }
 
         let spawnHeight = groundHeight(8, 8)
@@ -206,6 +245,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         camera.position.y = spawnHeight + playerController.eyeHeight
         self.playerController = playerController
         self.isSolidAt = isSolidAt
+        self.waterSurfaceHeight = waterSurfaceHeight
 
         super.init()
     }
@@ -235,12 +275,33 @@ final class Renderer: NSObject, MTKViewDelegate {
         // only the player's own movement/physics freezes.
         if !isPaused {
             playerController.update(input: inputController, deltaTime: deltaTime)
+            hotbar.update(input: inputController)
         }
+        onHotbarSelectionChanged?(hotbar.selectedIndex)
         chunkManager.update(around: camera.position)
         logBenchmark(deltaTime: deltaTime)
 
         currentBufferIndex = (currentBufferIndex + 1) % maxBuffersInFlight
         let uniformBuffer = uniformBuffers[currentBufferIndex]
+
+        let eyePosition = camera.eyePosition
+        // Hysteresis, not a single hard threshold: the water surface itself
+        // bobs (see vertex_water's wave) and the camera bobs a little too, so
+        // a flat "eye.y < waterTop" flips every frame near the boundary —
+        // fog/clear color strobing between sky and underwater each frame.
+        // Requiring a full crossing of a small dead-band before flipping
+        // state fixes that without needing to touch the wave itself.
+        if let waterTop = waterSurfaceHeight(eyePosition.x, eyePosition.z) {
+            if isCameraUnderwater {
+                isCameraUnderwater = eyePosition.y < waterTop + underwaterHysteresis
+            } else {
+                isCameraUnderwater = eyePosition.y < waterTop - underwaterHysteresis
+            }
+        } else {
+            isCameraUnderwater = false
+        }
+        let currentFogColor = isCameraUnderwater ? underwaterFogColor : fogColor
+        let currentFogDistance = isCameraUnderwater ? underwaterFogDistance : fogDistance
 
         let modelMatrix = matrix_identity_float4x4
         let projectionMatrix = Math.perspective(fovyRadians: .pi / 4, aspect: aspectRatio, near: 0.1, far: farPlane)
@@ -251,9 +312,9 @@ final class Renderer: NSObject, MTKViewDelegate {
             viewProjectionMatrix: viewProjectionMatrix,
             normalMatrix: matrix_identity_float3x3,
             lightDirection: normalize(SIMD3<Float>(-0.4, -1, -0.3)),
-            cameraPosition: camera.eyePosition,
-            fogColor: fogColor,
-            fogDistance: fogDistance,
+            cameraPosition: eyePosition,
+            fogColor: currentFogColor,
+            fogDistance: currentFogDistance,
             time: elapsedTime
         )
         memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
@@ -265,7 +326,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
-            red: Double(fogColor.x), green: Double(fogColor.y), blue: Double(fogColor.z), alpha: 1.0
+            red: Double(currentFogColor.x), green: Double(currentFogColor.y), blue: Double(currentFogColor.z), alpha: 1.0
         )
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
@@ -299,14 +360,21 @@ final class Renderer: NSObject, MTKViewDelegate {
             draw(chunk.foliage, with: encoder)
         }
 
-        if let target = targetedBlock() {
-            drawBlockHighlight(around: target, with: encoder)
+        if let hit = raycastTargetBlock() {
+            drawBlockHighlight(around: hit.block, with: encoder)
         }
 
         // Water pass second, over the now depth-written opaque scene, blended
-        // and without writing depth of its own.
+        // and without writing depth of its own. Culling off: the surface
+        // needs to render as a visible ceiling from underneath, and the
+        // shoreline/lakebed depth walls need to read as an enclosure when
+        // swimming inside one, not just show their single outward face.
+        // fragment_water flips the normal on back-facing fragments, so both
+        // sides are correctly lit either way instead of a wall's backside
+        // rendering as an unlit dark sliver.
         encoder.setRenderPipelineState(waterPipelineState)
         encoder.setDepthStencilState(waterDepthState)
+        encoder.setCullMode(.none)
         for chunk in chunkManager.loadedChunks.values {
             draw(chunk.water, with: encoder)
         }
@@ -365,22 +433,57 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let highlightReach: Float = 6
     private let highlightStep: Float = 0.08
 
+    private struct RaycastHit {
+        let block: SIMD3<Int>        // the solid block hit — what breaking removes
+        let placeAt: SIMD3<Int>?     // the empty cell just before it — where placing goes; nil if the ray started inside something solid
+    }
+
     /// Marches from the player's own position (not the third-person camera —
     /// the reticle always reflects what the player is facing) along their
-    /// look direction, returning the integer coordinate of the first solid
-    /// block hit within `highlightReach`, or nil if nothing's in range.
-    private func targetedBlock() -> SIMD3<Int>? {
+    /// look direction, up to `highlightReach`. Tracks the last empty cell
+    /// visited before the hit, which is standard-resolution face detection:
+    /// at this step size it's always the specific face that got hit, without
+    /// needing to compute an actual surface normal.
+    private func raycastTargetBlock() -> RaycastHit? {
         let origin = camera.position
         let direction = camera.front
         var traveled: Float = highlightStep
+        var lastEmpty: SIMD3<Int>?
         while traveled < highlightReach {
             let sample = origin + direction * traveled
+            let blockCoord = SIMD3<Int>(Int(sample.x.rounded(.down)), Int(sample.y.rounded(.down)), Int(sample.z.rounded(.down)))
             if isSolidAt(sample.x, sample.y, sample.z) {
-                return SIMD3<Int>(Int(sample.x.rounded(.down)), Int(sample.y.rounded(.down)), Int(sample.z.rounded(.down)))
+                return RaycastHit(block: blockCoord, placeAt: lastEmpty)
             }
+            lastEmpty = blockCoord
             traveled += highlightStep
         }
         return nil
+    }
+
+    /// Left click: removes whatever block the player is looking at.
+    func breakTargetedBlock() {
+        guard !isPaused, let hit = raycastTargetBlock() else { return }
+        blockEdits.set(BlockCoord(hit.block), to: .air)
+        chunkManager.rebuildAffectedChunks(byEditAt: hit.block)
+    }
+
+    /// Right click: places the hotbar's selected block into the empty cell
+    /// adjacent to whatever face the player is looking at.
+    func placeBlock() {
+        guard !isPaused, let hit = raycastTargetBlock(), let placeAt = hit.placeAt else { return }
+
+        // Don't let the player wall themselves in.
+        let playerColumnX = Int(camera.position.x.rounded(.down))
+        let playerColumnZ = Int(camera.position.z.rounded(.down))
+        let feetY = Int((camera.position.y - playerController.eyeHeight).rounded(.down))
+        let headY = Int(camera.position.y.rounded(.down))
+        if placeAt.x == playerColumnX, placeAt.z == playerColumnZ, placeAt.y >= feetY, placeAt.y <= headY {
+            return
+        }
+
+        blockEdits.set(BlockCoord(placeAt), to: hotbar.selectedType)
+        chunkManager.rebuildAffectedChunks(byEditAt: placeAt)
     }
 
     // Rebuilt fresh every frame around whatever block is targeted (see

@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pauseMenuView: PauseMenuView!
     var settingsMenuView: SettingsMenuView!
     var debugOverlayView: DebugOverlayView!
+    var hotbarView: HotbarView!
 
     private var gameHasStarted = false
     private var currentRenderDistance = 6 // must match ChunkManager's default loadRadius
@@ -24,7 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                            styleMask: [.titled, .closable, .miniaturizable, .resizable],
                            backing: .buffered,
                            defer: false)
-        window.title = "Procedural Terrain — WASD walk, mouse to look, Space jump, Shift sprint, C camera, H debug"
+        window.title = "Procedural Terrain — WASD walk, mouse to look, Space jump, click to break/place, 1-7 hotbar, Shift sprint, C camera, H debug"
         window.center()
         window.acceptsMouseMovedEvents = true
 
@@ -49,6 +50,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         debugOverlayView.autoresizingMask = [.width, .height]
         debugOverlayView.isHidden = true
         mtkView.addSubview(debugOverlayView)
+
+        let hotbarColors = renderer.hotbar.items.map { item -> NSColor in
+            let c = item.color
+            return NSColor(red: CGFloat(c.x), green: CGFloat(c.y), blue: CGFloat(c.z), alpha: 1)
+        }
+        hotbarView = HotbarView(frame: mtkView.bounds, colors: hotbarColors)
+        hotbarView.autoresizingMask = [.width, .height]
+        mtkView.addSubview(hotbarView)
 
         settingsMenuView = SettingsMenuView(frame: mtkView.bounds)
         settingsMenuView.autoresizingMask = [.width, .height]
@@ -77,7 +86,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         mtkView.onEscape = { [weak self] in self?.handleEscape() }
         mtkView.onToggleDebugOverlay = { [weak self] in self?.debugOverlayView.isHidden.toggle() }
+        mtkView.onBreakBlock = { [weak self] in self?.renderer.breakTargetedBlock() }
+        mtkView.onPlaceBlock = { [weak self] in self?.renderer.placeBlock() }
         renderer.onStatsUpdate = { [weak self] text in self?.debugOverlayView.setText(text) }
+        renderer.onHotbarSelectionChanged = { [weak self] index in self?.hotbarView.setSelectedIndex(index) }
 
         // If the window loses focus (Cmd-Tab, another app's window comes
         // forward) while playing, pause — otherwise the cursor would stay

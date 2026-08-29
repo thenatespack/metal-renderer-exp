@@ -127,6 +127,33 @@ final class TerrainGenerator {
         return nil
     }
 
+    /// The purely procedural block at an absolute world coordinate, ignoring
+    /// player edits entirely — that's layered on top by whoever calls this
+    /// (Chunk for meshing, Renderer for collision/raycasts). Recomputes
+    /// `columnInfo` fresh on every call rather than caching, which is fine
+    /// for the low call volumes those two use it at (a handful of samples a
+    /// frame), but would be far too slow for Chunk's actual per-voxel mesh
+    /// loop — that path keeps its own cached-per-column table instead of
+    /// calling this.
+    func proceduralBlock(x: Int, y: Int, z: Int, worldHeight: Int) -> VoxelType {
+        if y < 0 { return .stone }
+        if y >= worldHeight { return .air }
+
+        let info = columnInfo(x: x, z: z)
+        if y > info.height {
+            if y <= info.height + Self.treeSearchBand, let tree = treeBlock(x: x, y: y, z: z) {
+                return tree
+            }
+            return y <= Self.seaLevel ? .water : .air
+        } else if y == info.height {
+            return info.topBlock
+        } else if y >= info.height - 3 {
+            return info.subBlock
+        } else {
+            return .stone
+        }
+    }
+
     /// Deterministic [0, 1) hash of (a, b, salt, seed). Cheap integer mixing —
     /// used to reject the overwhelming majority of tree cell candidates before
     /// ever touching the noise-based `columnInfo`.
