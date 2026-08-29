@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:metal-renderer-exp}",
+            "name": "Debug MetalRenderer",
+            "target": "MetalRenderer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MetalRenderer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:metal-renderer-exp}",
+            "name": "Release MetalRenderer",
+            "target": "MetalRenderer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MetalRenderer"
+        }
+    ]
+}
