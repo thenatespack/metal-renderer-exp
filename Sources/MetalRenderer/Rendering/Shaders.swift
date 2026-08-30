@@ -178,5 +178,68 @@ enum Shaders {
                                         constant Uniforms &uniforms [[buffer(1)]]) {
         return float4(in.color, 1.0);
     }
+
+    struct PostVertexOut {
+        float4 position [[position]];
+        float2 uv;
+    };
+
+    struct PostEffectUniforms {
+        int effect;
+    };
+
+    // Fullscreen triangle covering the whole viewport in one draw call (no
+    // vertex/index buffers needed) — the standard trick of over-sizing a
+    // single triangle past NDC bounds so the clipped remainder exactly fills
+    // the screen, cheaper than a two-triangle quad.
+    vertex PostVertexOut vertex_post(uint vertexID [[vertex_id]]) {
+        float2 positions[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+        float2 p = positions[vertexID];
+        PostVertexOut out;
+        out.position = float4(p, 0.0, 1.0);
+        out.uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+        return out;
+    }
+
+    // Applies the settings-menu post effect to the fully-rendered scene
+    // texture. `none` still passes through this shader (rather than skipping
+    // the pass) so there's a single code path regardless of resolution scale
+    // or which effect is picked.
+    fragment float4 fragment_post(PostVertexOut in [[stage_in]],
+                                   texture2d<float> sceneTexture [[texture(0)]],
+                                   constant PostEffectUniforms &postUniforms [[buffer(0)]]) {
+        constexpr sampler s(mag_filter::linear, min_filter::linear);
+        float3 color = sceneTexture.sample(s, in.uv).rgb;
+
+        switch (postUniforms.effect) {
+            case 1: { // Grayscale
+                float gray = dot(color, float3(0.299, 0.587, 0.114));
+                color = float3(gray);
+                break;
+            }
+            case 2: { // Sepia
+                float3 sepia;
+                sepia.r = dot(color, float3(0.393, 0.769, 0.189));
+                sepia.g = dot(color, float3(0.349, 0.686, 0.168));
+                sepia.b = dot(color, float3(0.272, 0.534, 0.131));
+                color = clamp(sepia, 0.0, 1.0);
+                break;
+            }
+            case 3: { // Invert
+                color = 1.0 - color;
+                break;
+            }
+            case 4: { // Vignette
+                float2 d = in.uv - 0.5;
+                float vignette = 1.0 - smoothstep(0.35, 0.75, length(d));
+                color *= mix(0.35, 1.0, vignette);
+                break;
+            }
+            default:
+                break; // None
+        }
+
+        return float4(color, 1.0);
+    }
     """
 }

@@ -16,3 +16,10 @@ struct Uniforms {
     var fogDistance: Float
     var time: Float
 }
+
+/// Passed to fragment_post via setFragmentBytes — deliberately separate from
+/// the main Uniforms buffer since the post-process pass doesn't need any of
+/// the scene's own transform/lighting data.
+struct PostEffectUniforms {
+    var effect: Int32
+}

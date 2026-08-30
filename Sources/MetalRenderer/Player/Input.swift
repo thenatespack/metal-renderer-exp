@@ -7,9 +7,11 @@ enum KeyCode {
     static let space: UInt16 = 49
     static let c: UInt16 = 8
     static let h: UInt16 = 4
+    static let i: UInt16 = 34
     static let escape: UInt16 = 53
     // Standard ANSI number-row codes — not sequential, so listed explicitly.
-    static let digits: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28, 25] // 1...9
+    // Order matches the hotbar's 10 slots: 1...9, then 0.
+    static let digits: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28, 25, 29] // 1...9, 0
 }
 
 /// Tracks currently-held keys, modifier state, and accumulated mouse-drag deltas.
@@ -17,6 +19,10 @@ enum KeyCode {
 final class InputController {
     private(set) var pressedKeys = Set<UInt16>()
     var shiftPressed = false
+    /// Held state of the left mouse button — survival-mode breaking needs
+    /// "still holding," not just the discrete mouseDown click creative mode
+    /// uses, so this is tracked continuously rather than as an edge.
+    private(set) var isLeftMouseDown = false
 
     private var accumDX: Float = 0
     private var accumDY: Float = 0
@@ -39,6 +45,10 @@ final class InputController {
         pressedEdges.remove(code) != nil
     }
 
+    func setLeftMouseDown(_ down: Bool) {
+        isLeftMouseDown = down
+    }
+
     func addMouseDelta(dx: Float, dy: Float) {
         accumDX += dx
         accumDY += dy
@@ -59,6 +69,7 @@ final class InputController {
         pressedKeys.removeAll()
         pressedEdges.removeAll()
         shiftPressed = false
+        isLeftMouseDown = false
         accumDX = 0
         accumDY = 0
     }

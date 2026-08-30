@@ -11,6 +11,20 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let waterPipelineState: MTLRenderPipelineState
     private let waterDepthState: MTLDepthStencilState
     private let highlightPipelineState: MTLRenderPipelineState
+    private let postProcessPipelineState: MTLRenderPipelineState
+
+    // Scene is rendered opaque/foliage/water/highlight into these offscreen
+    // textures first, then a second full-screen pass (fragment_post) samples
+    // sceneColorTexture into the drawable — this is what makes both the post
+    // effect and the resolution scale possible: the offscreen textures can be
+    // smaller than the drawable and still get stretched to fill it. Sized in
+    // rebuildOffscreenTextures, driven off drawableSizeWillChange and
+    // setResolutionScale.
+    private var sceneColorTexture: MTLTexture?
+    private var sceneDepthTexture: MTLTexture?
+    private var currentDrawableSize: CGSize = .zero
+    private var resolutionScale: Float = 1.0
+    private(set) var postEffect: PostEffect = .none
 
     private let chunkManager: ChunkManager
 
@@ -24,18 +38,47 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let playerController: PlayerController
     private let isSolidAt: (Float, Float, Float) -> Bool
     private let waterSurfaceHeight: (Float, Float) -> Float?
+    private let blockAt: (Int, Int, Int) -> VoxelType
     private let blockEdits = BlockEdits()
-    let hotbar = Hotbar()
+    let hotbar: Hotbar
+    private(set) var gameMode: GameMode = .creative
     private var lastFrameTime = CACurrentMediaTime()
     private var elapsedTime: Float = 0
+
+    // Survival breaking: which block (if any) is currently being chipped
+    // away, and how far along. Reset whenever the target changes, the mouse
+    // is released, or the mode isn't survival — see updateSurvivalBreaking.
+    private var breakingTarget: SIMD3<Int>?
+    private var breakingProgress: Float = 0
+
+    private struct DroppedItem {
+        let type: VoxelType
+        var position: SIMD3<Float>
+        var verticalVelocity: Float = 0
+        let spawnTime: CFTimeInterval
+    }
+    private var droppedItems: [DroppedItem] = []
+    private let itemPickupRadius: Float = 1.5
+    private let itemDespawnSeconds: CFTimeInterval = 120
+    // Matches PlayerController.gravity so items fall at the same rate the
+    // player does, for a consistent feel.
+    private let droppedItemGravity: Float = 22
+    private let droppedItemSize: Float = 0.3
 
     var isPaused = false
     /// Called once a second (see logBenchmark) with a formatted multi-line
     /// stats string, for the debug overlay (H) to display.
     var onStatsUpdate: ((String) -> Void)?
-    /// Called every frame with the hotbar's current selected index, for
-    /// HotbarView to highlight.
-    var onHotbarSelectionChanged: ((Int) -> Void)?
+    /// Called every frame with the hotbar's current slots and selected
+    /// index, for HotbarView to display.
+    var onHotbarChanged: (([HotbarSlot], Int) -> Void)?
+    /// Called every frame with survival break progress (0 when not
+    /// breaking), for BreakProgressView to display.
+    var onBreakProgressChanged: ((Float) -> Void)?
+    /// Called every frame with deltaTime, before input is consumed — lets
+    /// AppDelegate drive GameControllerManager's per-frame stick polling
+    /// without Renderer needing to import GameController/AppKit itself.
+    var onFrameTick: ((Float) -> Void)?
 
     private var aspectRatio: Float = 1
 
@@ -125,6 +168,20 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.waterPipelineState = makePipelineState(vertexFunctionName: "vertex_water", fragmentFunctionName: "fragment_water", blended: true)
         self.highlightPipelineState = makePipelineState(vertexFunctionName: "vertex_highlight", fragmentFunctionName: "fragment_highlight", blended: false)
 
+        guard let postVertexFunction = library.makeFunction(name: "vertex_post"),
+              let postFragmentFunction = library.makeFunction(name: "fragment_post") else {
+            fatalError("Could not find post-process shader functions")
+        }
+        let postPipelineDescriptor = MTLRenderPipelineDescriptor()
+        postPipelineDescriptor.vertexFunction = postVertexFunction
+        postPipelineDescriptor.fragmentFunction = postFragmentFunction
+        postPipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        do {
+            self.postProcessPipelineState = try device.makeRenderPipelineState(descriptor: postPipelineDescriptor)
+        } catch {
+            fatalError("Could not create post-process pipeline state: \(error)")
+        }
+
         func makeDepthState(writesDepth: Bool) -> MTLDepthStencilState {
             let depthDescriptor = MTLDepthStencilDescriptor()
             depthDescriptor.depthCompareFunction = .less
@@ -168,6 +225,15 @@ final class Renderer: NSObject, MTKViewDelegate {
             return generator.proceduralBlock(x: x, y: y, z: z, worldHeight: worldHeight)
         }
 
+        // VoxelType.isSolid means "opaque for rendering" (it's only false for
+        // .air) — water is deliberately "solid" by that definition, since the
+        // mesher needs it to block/cull faces. But every query below means
+        // "solid" as in "blocks the player" — water should never count there,
+        // since swimming into it is exactly what's supposed to happen.
+        func isObstacle(_ type: VoxelType) -> Bool {
+            type.isSolid && type != .water
+        }
+
         // The real solid terrain surface — no sea-level clamping, since
         // PlayerController's swimming physics needs to know how deep a
         // lakebed actually is, not just that it's underwater. +1 because a
@@ -192,7 +258,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             let bottom = min(proceduralHeight, editRange.lowerBound) - 1
             var y = top
             while y >= bottom {
-                if blockAt(ix, y, iz).isSolid { return Float(y + 1) }
+                if isObstacle(blockAt(ix, y, iz)) { return Float(y + 1) }
                 y -= 1
             }
             return Float(bottom + 1)
@@ -220,16 +286,19 @@ final class Renderer: NSObject, MTKViewDelegate {
             let iz = Int(z.rounded(.down))
             let surfaceTop = Int(groundHeight(x, z))
             for y in surfaceTop..<(surfaceTop + playerBodyHeightBlocks) {
-                if blockAt(ix, y, iz).isSolid { return true }
+                if isObstacle(blockAt(ix, y, iz)) { return true }
             }
             return false
         }
 
         // General point-in-solid query, used by the third-person camera to
         // stop short of clipping through terrain/trees/placed blocks behind
-        // the player, and by the break/place raycast to find a target.
+        // the player (water doesn't count — the camera should follow right
+        // in when the player swims, not treat the surface as a wall), and by
+        // the break/place raycast to find a target (so it passes through
+        // water to whatever's beyond/beneath it, instead of "breaking" water).
         let isSolidAt: (Float, Float, Float) -> Bool = { x, y, z in
-            blockAt(Int(x.rounded(.down)), Int(y.rounded(.down)), Int(z.rounded(.down))).isSolid
+            isObstacle(blockAt(Int(x.rounded(.down)), Int(y.rounded(.down)), Int(z.rounded(.down))))
         }
 
         let spawnHeight = groundHeight(8, 8)
@@ -246,12 +315,46 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.playerController = playerController
         self.isSolidAt = isSolidAt
         self.waterSurfaceHeight = waterSurfaceHeight
+        self.blockAt = blockAt
+        self.hotbar = Hotbar(gameMode: .creative)
 
         super.init()
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         aspectRatio = size.width > 0 && size.height > 0 ? Float(size.width / size.height) : 1
+        currentDrawableSize = size
+        rebuildOffscreenTextures()
+    }
+
+    /// Settings-menu hook: renders the scene into an offscreen texture at
+    /// `scale` × the drawable's size, which the post-process pass then
+    /// stretches to fill the actual drawable — lower scales trade visual
+    /// crispness for fewer shaded pixels per frame.
+    func setResolutionScale(_ scale: Float) {
+        resolutionScale = scale
+        rebuildOffscreenTextures()
+    }
+
+    /// Settings-menu hook.
+    func setPostEffect(_ effect: PostEffect) {
+        postEffect = effect
+    }
+
+    private func rebuildOffscreenTextures() {
+        guard currentDrawableSize.width > 0, currentDrawableSize.height > 0 else { return }
+        let width = max(1, Int(Float(currentDrawableSize.width) * resolutionScale))
+        let height = max(1, Int(Float(currentDrawableSize.height) * resolutionScale))
+
+        let colorDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        colorDescriptor.usage = [.renderTarget, .shaderRead]
+        colorDescriptor.storageMode = .private
+        sceneColorTexture = device.makeTexture(descriptor: colorDescriptor)
+
+        let depthDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: width, height: height, mipmapped: false)
+        depthDescriptor.usage = .renderTarget
+        depthDescriptor.storageMode = .private
+        sceneDepthTexture = device.makeTexture(descriptor: depthDescriptor)
     }
 
     func draw(in view: MTKView) {
@@ -270,14 +373,18 @@ final class Renderer: NSObject, MTKViewDelegate {
         let deltaTime = Float(now - lastFrameTime)
         lastFrameTime = now
         elapsedTime += deltaTime
+        onFrameTick?(deltaTime)
         // Chunk streaming keeps running even while paused, so the world
         // around spawn is already loaded by the time the player hits Play —
         // only the player's own movement/physics freezes.
         if !isPaused {
             playerController.update(input: inputController, deltaTime: deltaTime)
             hotbar.update(input: inputController)
+            updateSurvivalBreaking(deltaTime: deltaTime)
+            updateDroppedItems(deltaTime: deltaTime)
         }
-        onHotbarSelectionChanged?(hotbar.selectedIndex)
+        onHotbarChanged?(hotbar.slots, hotbar.selectedIndex)
+        onBreakProgressChanged?(breakingProgress)
         chunkManager.update(around: camera.position)
         logBenchmark(deltaTime: deltaTime)
 
@@ -319,17 +426,29 @@ final class Renderer: NSObject, MTKViewDelegate {
         )
         memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
 
-        guard let renderPassDescriptor = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable else {
+        guard let drawable = view.currentDrawable,
+              let sceneColorTexture, let sceneDepthTexture else {
             inFlightSemaphore.signal()
             return
         }
 
-        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
+        // Scene renders into an offscreen texture (its own resolution,
+        // independent of the drawable — see setResolutionScale) rather than
+        // straight to the drawable; the post-process pass below samples it
+        // and stretches it to fill the actual screen.
+        let scenePassDescriptor = MTLRenderPassDescriptor()
+        scenePassDescriptor.colorAttachments[0].texture = sceneColorTexture
+        scenePassDescriptor.colorAttachments[0].loadAction = .clear
+        scenePassDescriptor.colorAttachments[0].storeAction = .store
+        scenePassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
             red: Double(currentFogColor.x), green: Double(currentFogColor.y), blue: Double(currentFogColor.z), alpha: 1.0
         )
+        scenePassDescriptor.depthAttachment.texture = sceneDepthTexture
+        scenePassDescriptor.depthAttachment.loadAction = .clear
+        scenePassDescriptor.depthAttachment.storeAction = .dontCare
+        scenePassDescriptor.depthAttachment.clearDepth = 1.0
 
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: scenePassDescriptor) else {
             inFlightSemaphore.signal()
             return
         }
@@ -353,6 +472,10 @@ final class Renderer: NSObject, MTKViewDelegate {
             drawPlayerModel(with: encoder)
         }
 
+        // Still the opaque pipeline/depth state — dropped items are solid,
+        // lit cubes like anything else, just rebuilt fresh each frame.
+        drawDroppedItems(with: encoder)
+
         // Foliage: same opaque depth state as terrain (it writes depth, no
         // blending), just a different vertex function for the wind sway.
         encoder.setRenderPipelineState(foliagePipelineState)
@@ -361,7 +484,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         if let hit = raycastTargetBlock() {
-            drawBlockHighlight(around: hit.block, with: encoder)
+            let progress = (hit.block == breakingTarget) ? breakingProgress : 0
+            drawBlockHighlight(around: hit.block, progress: progress, with: encoder)
         }
 
         // Water pass second, over the now depth-written opaque scene, blended
@@ -379,6 +503,28 @@ final class Renderer: NSObject, MTKViewDelegate {
             draw(chunk.water, with: encoder)
         }
         encoder.endEncoding()
+
+        // Post-process pass: a full-screen triangle sampling sceneColorTexture
+        // straight into the drawable. Always runs, even for .none, so there's
+        // one code path regardless of which effect (or resolution scale) is
+        // active — the shader itself just passes color through unmodified.
+        guard let postPassDescriptor = view.currentRenderPassDescriptor else {
+            inFlightSemaphore.signal()
+            return
+        }
+        postPassDescriptor.colorAttachments[0].loadAction = .dontCare
+        postPassDescriptor.depthAttachment.texture = nil
+
+        guard let postEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postPassDescriptor) else {
+            inFlightSemaphore.signal()
+            return
+        }
+        postEncoder.setRenderPipelineState(postProcessPipelineState)
+        postEncoder.setFragmentTexture(sceneColorTexture, index: 0)
+        var postUniforms = PostEffectUniforms(effect: Int32(postEffect.rawValue))
+        postEncoder.setFragmentBytes(&postUniforms, length: MemoryLayout<PostEffectUniforms>.stride, index: 0)
+        postEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        postEncoder.endEncoding()
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
@@ -461,17 +607,24 @@ final class Renderer: NSObject, MTKViewDelegate {
         return nil
     }
 
-    /// Left click: removes whatever block the player is looking at.
+    /// Left click: in creative, removes whatever block the player is looking
+    /// at instantly — no drop, matching "you already have infinite blocks."
+    /// In survival, breaking instead happens gradually in updateSurvivalBreaking
+    /// (driven by the held mouse button, not this discrete click), so this
+    /// is a no-op there.
     func breakTargetedBlock() {
-        guard !isPaused, let hit = raycastTargetBlock() else { return }
+        guard !isPaused, gameMode == .creative, let hit = raycastTargetBlock() else { return }
         blockEdits.set(BlockCoord(hit.block), to: .air)
         chunkManager.rebuildAffectedChunks(byEditAt: hit.block)
     }
 
     /// Right click: places the hotbar's selected block into the empty cell
-    /// adjacent to whatever face the player is looking at.
+    /// adjacent to whatever face the player is looking at. In survival,
+    /// consumes one from that slot — an empty slot (nothing selected) simply
+    /// can't place anything.
     func placeBlock() {
-        guard !isPaused, let hit = raycastTargetBlock(), let placeAt = hit.placeAt else { return }
+        guard !isPaused, let hit = raycastTargetBlock(), let placeAt = hit.placeAt,
+              let selectedType = hotbar.selectedType else { return }
 
         // Don't let the player wall themselves in.
         let playerColumnX = Int(camera.position.x.rounded(.down))
@@ -482,15 +635,150 @@ final class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
-        blockEdits.set(BlockCoord(placeAt), to: hotbar.selectedType)
+        blockEdits.set(BlockCoord(placeAt), to: selectedType)
         chunkManager.rebuildAffectedChunks(byEditAt: placeAt)
+        if gameMode == .survival {
+            hotbar.consumeSelected()
+        }
+    }
+
+    /// Settings-menu hook. Resets the hotbar for the new mode (survival
+    /// clears it — you don't keep creative's free blocks; switching back to
+    /// creative refills it) and cancels any in-progress break.
+    func setGameMode(_ mode: GameMode) {
+        gameMode = mode
+        hotbar.reset(for: mode)
+        breakingTarget = nil
+        breakingProgress = 0
+    }
+
+    /// Advances survival's held-to-break progress against whatever's
+    /// currently targeted. Switching targets (or letting go, or the mode not
+    /// being survival) resets progress rather than pausing it — no
+    /// accumulating partial progress on a block by tapping at it repeatedly.
+    private func updateSurvivalBreaking(deltaTime: Float) {
+        guard gameMode == .survival, inputController.isLeftMouseDown,
+              let hit = raycastTargetBlock() else {
+            breakingTarget = nil
+            breakingProgress = 0
+            return
+        }
+
+        if breakingTarget != hit.block {
+            breakingTarget = hit.block
+            breakingProgress = 0
+        }
+
+        let type = blockAt(hit.block.x, hit.block.y, hit.block.z)
+        breakingProgress += deltaTime / type.breakDuration
+        guard breakingProgress >= 1 else { return }
+
+        blockEdits.set(BlockCoord(hit.block), to: .air)
+        chunkManager.rebuildAffectedChunks(byEditAt: hit.block)
+        droppedItems.append(DroppedItem(
+            type: type,
+            position: SIMD3<Float>(Float(hit.block.x) + 0.5, Float(hit.block.y) + 0.5, Float(hit.block.z) + 0.5),
+            spawnTime: CACurrentMediaTime()
+        ))
+        breakingTarget = nil
+        breakingProgress = 0
+    }
+
+    /// The nearest solid surface at or below `y` in this column, scanning
+    /// downward from the item's own current height — unlike groundHeight
+    /// (which finds the column's overall topmost surface, correct for
+    /// player-standing but wrong here), this finds the actual floor
+    /// underneath an item that's falling inside a cave, tunnel, or overhang,
+    /// rather than the outer hill surface somewhere above it.
+    private func floorHeight(x: Float, z: Float, below y: Float) -> Float {
+        let ix = Int(x.rounded(.down))
+        let iz = Int(z.rounded(.down))
+        var scanY = Int(y.rounded(.down))
+        let hardFloor = -4 // proceduralBlock treats y < 0 as solid stone, so this is never actually reached
+        while scanY > hardFloor {
+            if isSolidAt(Float(ix) + 0.5, Float(scanY), Float(iz) + 0.5) {
+                return Float(scanY + 1)
+            }
+            scanY -= 1
+        }
+        return Float(hardFloor + 1)
+    }
+
+    /// Falls each item toward the nearest floor beneath it, picks up any
+    /// within reach, and clears out old ones nobody collected.
+    private func updateDroppedItems(deltaTime: Float) {
+        guard !droppedItems.isEmpty else { return }
+        let now = CACurrentMediaTime()
+        let pickupRadiusSq = itemPickupRadius * itemPickupRadius
+        // Measured from the feet, not the eye/camera position — an item
+        // resting on the ground is roughly at foot height, and comparing
+        // against eye height (playerController.eyeHeight above that) would
+        // put it outside the pickup radius even standing right on top of it.
+        let feetPosition = SIMD3<Float>(camera.position.x, camera.position.y - playerController.eyeHeight, camera.position.z)
+        var remaining: [DroppedItem] = []
+        remaining.reserveCapacity(droppedItems.count)
+        for var item in droppedItems {
+            // Rests with its center droppedItemSize/2 above the surface, so
+            // its bottom face sits flush on the ground rather than half-buried.
+            let restHeight = floorHeight(x: item.position.x, z: item.position.z, below: item.position.y) + droppedItemSize / 2
+            if item.position.y > restHeight {
+                item.verticalVelocity -= droppedItemGravity * deltaTime
+                item.position.y = max(restHeight, item.position.y + item.verticalVelocity * deltaTime)
+                if item.position.y <= restHeight {
+                    item.verticalVelocity = 0
+                }
+            } else {
+                item.verticalVelocity = 0
+            }
+
+            let dx = item.position.x - feetPosition.x
+            let dy = item.position.y - feetPosition.y
+            let dz = item.position.z - feetPosition.z
+            if dx * dx + dy * dy + dz * dz < pickupRadiusSq {
+                hotbar.addItem(item.type)
+                continue
+            }
+            if now - item.spawnTime > itemDespawnSeconds {
+                continue
+            }
+            remaining.append(item)
+        }
+        droppedItems = remaining
+    }
+
+    private func drawDroppedItems(with encoder: MTLRenderCommandEncoder) {
+        guard !droppedItems.isEmpty else { return }
+        var vertices: [Vertex] = []
+        var indices: [UInt32] = []
+        for item in droppedItems {
+            let age = Float(CACurrentMediaTime() - item.spawnTime)
+            // abs() keeps the bob from ever dipping the item below the ground
+            // it just landed on — a resting item gently hops rather than
+            // sinking half a cycle into the floor.
+            let bob = abs(sin(age * 2.5)) * 0.08
+            let center = item.position + SIMD3<Float>(0, bob, 0)
+            DroppedItemMesh.appendCube(center: center, size: droppedItemSize, yaw: age * 1.4, color: item.type.color, into: &vertices, indices: &indices)
+        }
+        guard let vertexBuffer = device.makeBuffer(bytes: vertices, length: MemoryLayout<Vertex>.stride * vertices.count, options: .storageModeShared),
+              let indexBuffer = device.makeBuffer(bytes: indices, length: MemoryLayout<UInt32>.stride * indices.count, options: .storageModeShared) else {
+            return
+        }
+        draw(ChunkGeometry(vertexBuffer: vertexBuffer, indexBuffer: indexBuffer, indexCount: indices.count), with: encoder)
     }
 
     // Rebuilt fresh every frame around whatever block is targeted (see
     // BlockHighlight) — trivially cheap (24 vertices), so no need to cache.
-    private func drawBlockHighlight(around block: SIMD3<Int>, with encoder: MTLRenderCommandEncoder) {
+    // `progress` (0...1, only nonzero mid-survival-break) shifts the outline
+    // from its resting near-black toward red and adds a small shake, so
+    // breaking reads as actively chipping away at something rather than
+    // just... waiting.
+    private func drawBlockHighlight(around block: SIMD3<Int>, progress: Float, with encoder: MTLRenderCommandEncoder) {
         let origin = SIMD3<Float>(Float(block.x), Float(block.y), Float(block.z))
-        let vertices = BlockHighlight.buildVertices(blockOrigin: origin, color: SIMD3<Float>(0.05, 0.05, 0.05))
+        let jitter: SIMD3<Float> = progress > 0
+            ? SIMD3<Float>(Float.random(in: -1...1), Float.random(in: -1...1), Float.random(in: -1...1)) * 0.01 * progress
+            : SIMD3<Float>(repeating: 0)
+        let color = Math.mix(SIMD3<Float>(0.05, 0.05, 0.05), SIMD3<Float>(0.95, 0.15, 0.05), progress)
+        let vertices = BlockHighlight.buildVertices(blockOrigin: origin + jitter, color: color)
         guard let vertexBuffer = device.makeBuffer(bytes: vertices, length: MemoryLayout<Vertex>.stride * vertices.count, options: .storageModeShared) else {
             return
         }

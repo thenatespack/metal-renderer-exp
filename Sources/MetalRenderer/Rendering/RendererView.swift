@@ -9,6 +9,7 @@ final class RendererView: MTKView {
     var inputController: InputController!
     var onEscape: (() -> Void)?
     var onToggleDebugOverlay: (() -> Void)?
+    var onToggleInventory: (() -> Void)?
     var onBreakBlock: (() -> Void)?
     var onPlaceBlock: (() -> Void)?
 
@@ -43,6 +44,9 @@ final class RendererView: MTKView {
         case KeyCode.h:
             onToggleDebugOverlay?()
             return
+        case KeyCode.i:
+            onToggleInventory?()
+            return
         default:
             break
         }
@@ -74,11 +78,20 @@ final class RendererView: MTKView {
         inputController.addMouseDelta(dx: Float(event.deltaX), dy: Float(event.deltaY))
     }
 
-    // Left click breaks, right click places — a menu overlay sits above this
-    // view and intercepts hit-testing whenever one is open (see PauseMenuView),
-    // so these only ever fire during actual gameplay.
+    // Left click breaks (creative: instantly, on this discrete event) and
+    // right click places — a menu overlay sits above this view and
+    // intercepts hit-testing whenever one is open (see PauseMenuView), so
+    // these only ever fire during actual gameplay. isLeftMouseDown is the
+    // continuous held state survival-mode breaking progresses against every
+    // frame (see Renderer.updateSurvivalBreaking), independent of this
+    // one-shot callback.
     override func mouseDown(with event: NSEvent) {
+        inputController.setLeftMouseDown(true)
         onBreakBlock?()
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        inputController.setLeftMouseDown(false)
     }
 
     override func rightMouseDown(with event: NSEvent) {
