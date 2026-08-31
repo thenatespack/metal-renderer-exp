@@ -73,7 +73,9 @@ final class Chunk {
                     return tree
                 }
                 return y <= TerrainGenerator.seaLevel ? .water : .air
-            } else if y == info.height {
+            }
+            guard !generator.isCarved(x: worldX, y: y, z: worldZ, surfaceHeight: info.height) else { return .air }
+            if y == info.height {
                 return info.topBlock
             } else if y >= info.height - 3 {
                 return info.subBlock

@@ -1,6 +1,7 @@
 import MetalKit
 import simd
 import QuartzCore
+import Foundation
 
 final class Renderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
@@ -39,7 +40,17 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let isSolidAt: (Float, Float, Float) -> Bool
     private let waterSurfaceHeight: (Float, Float) -> Float?
     private let blockAt: (Int, Int, Int) -> VoxelType
+    private let groundHeight: (Float, Float) -> Float
+    private let animalManager: AnimalManager
+    // Stateless/pure — see TerrainGenerator's own doc comment — so MapView's
+    // one-time snapshot (see terrainColor) can call it freely off to the side
+    // of the normal chunk-building path.
+    private let terrainGenerator: TerrainGenerator
     private let blockEdits = BlockEdits()
+    private let worldID: UUID
+    // Serial so overlapping saves (rapid-fire breaking/placing) don't race
+    // each other writing the same file — see persistSave/saveNow.
+    private let saveQueue = DispatchQueue(label: "com.metalrenderer.save", qos: .utility)
     let hotbar: Hotbar
     private(set) var gameMode: GameMode = .creative
     private var lastFrameTime = CACurrentMediaTime()
@@ -87,6 +98,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var benchFrameCount = 0
     private var benchFrameMsSum: Double = 0
     private var benchFrameMsMax: Double = 0
+    // CPU% is derived from the change in cumulative process CPU time across
+    // this same 1-second window (see logBenchmark) — this is the baseline
+    // that gets diffed against each time. GPU ms is instead updated as each
+    // frame's command buffer actually completes (see draw(in:)'s completion
+    // handler), independent of the 1-second window.
+    private var lastCPUSampleSeconds: Double = SystemStats.cpuTimeSeconds()
+    private var lastGPUFrameMs: Double = 0
 
     private let fogColor = SIMD3<Float>(0.53, 0.81, 0.92)
     // Tuned to roughly mask the chunk load/unload boundary (loadRadius * chunkSize)
@@ -105,7 +123,40 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var isCameraUnderwater = false
     private let farPlane: Float = 400
 
-    init(device: MTLDevice, inputController: InputController) {
+    // Day/night cycle: purely a function of elapsedTime, same as wave/
+    // foliage animation — it keeps advancing while paused/in menus, not
+    // just during active play. 12 in-game hours pass every 10 real
+    // minutes, so a full 24-hour cycle takes 20 real minutes.
+    private static let secondsPerGameHour: Float = (10 * 60) / 12
+    private let nightFogColor = SIMD3<Float>(0.04, 0.05, 0.10)
+    private let sunDistance: Float = 300
+    private let sunSize: Float = 30
+    private let moonSize: Float = 24
+    private let moonColor = SIMD3<Float>(0.80, 0.83, 0.92)
+
+    /// 0..<24, wrapping — the H overlay's clock (see logBenchmark).
+    var gameHours: Float {
+        let hours = elapsedTime / Self.secondsPerGameHour
+        return hours.truncatingRemainder(dividingBy: 24)
+    }
+
+    /// World-space direction toward the sun right now: rises at hour 6,
+    /// peaks straight overhead at noon, sets at hour 18, dips below the
+    /// horizon (negative y) overnight. Drives both the directional light
+    /// and where the sun disc itself is drawn (see draw(in:)/drawSun).
+    private var sunDirection: SIMD3<Float> {
+        let angle = (gameHours - 6) / 12 * Float.pi
+        return normalize(SIMD3<Float>(cos(angle), sin(angle), 0.35))
+    }
+
+    /// 0 at night, 1 at midday, with a gradient through sunrise/sunset
+    /// rather than a hard cutoff right at the horizon — blends the sky/fog
+    /// color and the sun disc's own tint (see drawSun).
+    private var daylightFactor: Float {
+        Math.clamp(sunDirection.y + 0.5, 0, 1)
+    }
+
+    init(device: MTLDevice, inputController: InputController, world: WorldMeta) {
         self.device = device
         self.inputController = inputController
 
@@ -201,9 +252,14 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let worldHeight = 48
         let chunkSize = 16
-        let seed = UInt64.random(in: 0...UInt64.max)
-        let generator = TerrainGenerator(seed: seed, worldHeight: worldHeight)
+        // A world is just its seed (TerrainGenerator is a pure function of
+        // it) plus every edit — WorldStore already wrote/loaded those before
+        // this Renderer was ever constructed (see AppDelegate.startGame), so
+        // this just replays the edits on top before anything else touches
+        // blockEdits/generator.
+        let generator = TerrainGenerator(seed: world.seed, worldHeight: worldHeight)
         let blockEdits = self.blockEdits
+        blockEdits.load(WorldStore.loadEdits(for: world.id))
         self.chunkManager = ChunkManager(device: device, generator: generator, blockEdits: blockEdits, chunkSize: chunkSize, worldHeight: worldHeight)
 
         for _ in 0..<maxBuffersInFlight {
@@ -241,27 +297,29 @@ final class Renderer: NSObject, MTKViewDelegate {
         // (see VoxelMesher/cubeCorners) — the walkable surface is its top
         // face, not the voxel's own coordinate.
         //
-        // Fast path when nobody's edited this column: the O(1) procedural
-        // answer, same as before edits existed at all. Only a column that
-        // actually has edits pays for scanning down from the higher of the
+        // Fast path when nobody's edited this column AND the natural surface
+        // itself isn't a cave/ravine mouth (see TerrainGenerator.isCarved —
+        // a ravine can carve right through the nominal surface block): the
+        // O(1) procedural answer, same as before caves/edits existed at all.
+        // Anything else pays for scanning down from the higher of the
         // procedural height or the highest edit to find the true topmost
-        // solid block — bounded by how far the player has actually built,
-        // not by worldHeight.
+        // solid block, all the way to bedrock — a ravine can run up to
+        // ravineMaxDepth blocks deep, so unlike edits (bounded by how far
+        // the player's actually built) this can't assume a shallow floor.
         let groundHeight: (Float, Float) -> Float = { x, z in
             let ix = Int(x.rounded(.down))
             let iz = Int(z.rounded(.down))
             let proceduralHeight = generator.columnInfo(x: ix, z: iz).height
-            guard let editRange = blockEdits.editedYRange(x: ix, z: iz) else {
+            let editRange = blockEdits.editedYRange(x: ix, z: iz)
+            if editRange == nil, !generator.isCarved(x: ix, y: proceduralHeight, z: iz, surfaceHeight: proceduralHeight) {
                 return Float(proceduralHeight + 1)
             }
-            let top = max(proceduralHeight, editRange.upperBound) + 1
-            let bottom = min(proceduralHeight, editRange.lowerBound) - 1
-            var y = top
-            while y >= bottom {
+            var y = max(proceduralHeight, editRange?.upperBound ?? proceduralHeight) + 1
+            while y >= 0 {
                 if isObstacle(blockAt(ix, y, iz)) { return Float(y + 1) }
                 y -= 1
             }
-            return Float(bottom + 1)
+            return 1 // bedrock fallback; proceduralBlock always returns solid stone below y=0 anyway
         }
 
         // The water surface height at this column, or nil if it's dry. A
@@ -301,8 +359,33 @@ final class Renderer: NSObject, MTKViewDelegate {
             isObstacle(blockAt(Int(x.rounded(.down)), Int(y.rounded(.down)), Int(z.rounded(.down))))
         }
 
-        let spawnHeight = groundHeight(8, 8)
-        let camera = Camera(position: SIMD3<Float>(8, spawnHeight, 8), yaw: 0, pitch: 0)
+        // Spawn column: search outward in rings from the origin for one
+        // whose natural surface isn't a cave/ravine mouth (see
+        // TerrainGenerator.isCarved) — a carved column's "ground" is
+        // actually that cave/ravine's own floor, which can be deep and
+        // enclosed (groundHeight would happily walk down into it, same as
+        // it does for any other overhang) rather than a safe, open place to
+        // start the game. Falls back to the origin itself in the
+        // astronomically unlikely case every ring up to radius 32 is carved.
+        func findSpawnColumn() -> (x: Int, z: Int) {
+            for radius in 0...32 {
+                for dz in -radius...radius {
+                    for dx in -radius...radius {
+                        guard max(abs(dx), abs(dz)) == radius else { continue } // only this ring's perimeter
+                        let x = 8 + dx
+                        let z = 8 + dz
+                        let info = generator.columnInfo(x: x, z: z)
+                        if !generator.isCarved(x: x, y: info.height, z: z, surfaceHeight: info.height) {
+                            return (x, z)
+                        }
+                    }
+                }
+            }
+            return (8, 8)
+        }
+        let spawnColumn = findSpawnColumn()
+        let spawnHeight = groundHeight(Float(spawnColumn.x), Float(spawnColumn.z))
+        let camera = Camera(position: SIMD3<Float>(Float(spawnColumn.x), spawnHeight, Float(spawnColumn.z)), yaw: 0, pitch: 0)
         self.camera = camera
         let playerController = PlayerController(
             camera: camera,
@@ -316,7 +399,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.isSolidAt = isSolidAt
         self.waterSurfaceHeight = waterSurfaceHeight
         self.blockAt = blockAt
+        self.groundHeight = groundHeight
+        self.terrainGenerator = generator
+        self.worldID = world.id
         self.hotbar = Hotbar(gameMode: .creative)
+        self.animalManager = AnimalManager(terrainGenerator: generator, groundHeight: groundHeight, waterSurfaceHeight: waterSurfaceHeight)
 
         super.init()
     }
@@ -325,6 +412,25 @@ final class Renderer: NSObject, MTKViewDelegate {
         aspectRatio = size.width > 0 && size.height > 0 ? Float(size.width / size.height) : 1
         currentDrawableSize = size
         rebuildOffscreenTextures()
+    }
+
+    /// Must be called (with the MTKView's draw loop already stopped, so
+    /// nothing new is calling draw() concurrently) before this Renderer is
+    /// released — see AppDelegate.quitToTitle. draw()'s wait() is matched by
+    /// a signal() from the GPU's completion handler, which can still be
+    /// pending for up to maxBuffersInFlight frames after the last draw()
+    /// call returns; deallocating inFlightSemaphore while any of those are
+    /// still outstanding traps in libdispatch (a semaphore can only be
+    /// disposed at its starting count). Re-acquiring every permit here
+    /// blocks until all of them have actually signaled, then immediately
+    /// hands them back so the semaphore is at its initial count either way.
+    func waitForPendingFrames() {
+        for _ in 0..<maxBuffersInFlight {
+            inFlightSemaphore.wait()
+        }
+        for _ in 0..<maxBuffersInFlight {
+            inFlightSemaphore.signal()
+        }
     }
 
     /// Settings-menu hook: renders the scene into an offscreen texture at
@@ -365,8 +471,16 @@ final class Renderer: NSObject, MTKViewDelegate {
             return
         }
 
-        commandBuffer.addCompletedHandler { [weak self] _ in
+        commandBuffer.addCompletedHandler { [weak self] buffer in
             self?.inFlightSemaphore.signal()
+            // gpuStartTime/EndTime are only valid once the buffer's actually
+            // completed (here) — fires on a Metal-internal thread, so hop to
+            // main before touching lastGPUFrameMs, same as ChunkManager's
+            // background-build handoff.
+            let gpuMs = (buffer.gpuEndTime - buffer.gpuStartTime) * 1000
+            DispatchQueue.main.async {
+                self?.lastGPUFrameMs = gpuMs
+            }
         }
 
         let now = CACurrentMediaTime()
@@ -382,6 +496,10 @@ final class Renderer: NSObject, MTKViewDelegate {
             hotbar.update(input: inputController)
             updateSurvivalBreaking(deltaTime: deltaTime)
             updateDroppedItems(deltaTime: deltaTime)
+            animalManager.update(around: camera.position, deltaTime: deltaTime)
+            for deadAnimal in animalManager.removeDeadAnimals() {
+                spawnAnimalDrops(for: deadAnimal)
+            }
         }
         onHotbarChanged?(hotbar.slots, hotbar.selectedIndex)
         onBreakProgressChanged?(breakingProgress)
@@ -407,8 +525,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         } else {
             isCameraUnderwater = false
         }
-        let currentFogColor = isCameraUnderwater ? underwaterFogColor : fogColor
+        let skyColor = Math.mix(nightFogColor, fogColor, daylightFactor)
+        let currentFogColor = isCameraUnderwater ? underwaterFogColor : skyColor
         let currentFogDistance = isCameraUnderwater ? underwaterFogDistance : fogDistance
+        let sunDirection = self.sunDirection
 
         let modelMatrix = matrix_identity_float4x4
         let projectionMatrix = Math.perspective(fovyRadians: .pi / 4, aspect: aspectRatio, near: 0.1, far: farPlane)
@@ -418,7 +538,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             modelMatrix: modelMatrix,
             viewProjectionMatrix: viewProjectionMatrix,
             normalMatrix: matrix_identity_float3x3,
-            lightDirection: normalize(SIMD3<Float>(-0.4, -1, -0.3)),
+            lightDirection: -sunDirection,
             cameraPosition: eyePosition,
             fogColor: currentFogColor,
             fogDistance: currentFogDistance,
@@ -460,6 +580,20 @@ final class Renderer: NSObject, MTKViewDelegate {
         encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
         encoder.setFragmentBuffer(uniformBuffer, offset: 0, index: 1)
 
+        // Drawn first, color-only (waterDepthState doesn't write depth): the
+        // opaque terrain below overwrites it pixel-for-pixel wherever
+        // something solid is actually in front, so this needs no depth
+        // comparison of its own to be correctly hidden behind hills/trees —
+        // the standard "skybox drawn first" ordering. The moon sits exactly
+        // opposite the sun (same great circle), so it's up whenever the sun
+        // is down and vice versa — no separate day/night gating needed,
+        // "below the horizon" already means "behind the terrain that just
+        // got drawn over it" via that same mechanism.
+        let sunColor = Math.mix(SIMD3<Float>(1.0, 0.55, 0.25), SIMD3<Float>(1.0, 0.98, 0.85), daylightFactor)
+        drawCelestialBody(direction: sunDirection, distance: sunDistance, size: sunSize, color: sunColor, with: encoder)
+        drawCelestialBody(direction: -sunDirection, distance: sunDistance, size: moonSize, color: moonColor, with: encoder)
+        encoder.setCullMode(.back) // the calls above leave it at .none for their own billboards — restore before opaque terrain
+
         encoder.setRenderPipelineState(pipelineState)
         encoder.setDepthStencilState(depthState)
         for chunk in chunkManager.loadedChunks.values {
@@ -475,6 +609,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         // Still the opaque pipeline/depth state — dropped items are solid,
         // lit cubes like anything else, just rebuilt fresh each frame.
         drawDroppedItems(with: encoder)
+        drawAnimals(with: encoder)
 
         // Foliage: same opaque depth state as terrain (it writes depth, no
         // blending), just a different vertex function for the wind sway.
@@ -499,6 +634,18 @@ final class Renderer: NSObject, MTKViewDelegate {
         encoder.setRenderPipelineState(waterPipelineState)
         encoder.setDepthStencilState(waterDepthState)
         encoder.setCullMode(.none)
+        // Side faces render even against a solid neighbor, not just air
+        // (see Chunk's water meshing doc comment — deliberate, so a
+        // submerged lakebed wall still reads as a "wall of depth"), which
+        // means that face and the solid block's own face behind it sit at
+        // the exact same plane. Two coincident surfaces z-fight: floating-
+        // point differences between this pipeline's and the opaque
+        // pipeline's matrix math make it a coin flip per pixel which one
+        // wins. A small negative depth bias reliably tips that coin toward
+        // water instead of nudging any actual vertex position — nudging
+        // geometry instead (tried first) opened a seam where the moved side
+        // face no longer lined up with its own unmoved top face.
+        encoder.setDepthBias(-2, slopeScale: -1, clamp: -0.0005)
         for chunk in chunkManager.loadedChunks.values {
             draw(chunk.water, with: encoder)
         }
@@ -541,24 +688,45 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let fps = Double(benchFrameCount) / Double(benchWindowSeconds)
         let avgMs = benchFrameMsSum / Double(benchFrameCount)
+
+        let currentCPUSeconds = SystemStats.cpuTimeSeconds()
+        // Raw user+sys time summed across cores can exceed 100% on a
+        // multi-core machine (Activity Monitor's convention) — dividing by
+        // core count instead normalizes to 0...100 as "share of the whole
+        // machine," which reads more like a usual "usage" percentage.
+        let rawCPUPercent = (currentCPUSeconds - lastCPUSampleSeconds) / Double(benchWindowSeconds) * 100
+        let cpuPercent = min(rawCPUPercent / Double(ProcessInfo.processInfo.activeProcessorCount), 100)
+        lastCPUSampleSeconds = currentCPUSeconds
+        let memoryMB = Double(SystemStats.memoryFootprintBytes()) / 1_048_576
+        // % of the frame's own time budget the GPU was actually busy — not
+        // system-wide GPU utilization (no public API for that), just how
+        // much of each frame this renderer's own draw calls occupied it.
+        let gpuPercentOfFrame = avgMs > 0 ? lastGPUFrameMs / avgMs * 100 : 0
+
         print(String(
-            format: "[bench] fps=%.1f avgFrameMs=%.2f maxFrameMs=%.2f loadedChunks=%d pending=%d triangles=%d chunkBuilds=%d avgChunkBuildMs=%.2f pos=(%.2f,%.2f,%.2f) grounded=%d swimming=%d",
+            format: "[bench] fps=%.1f avgFrameMs=%.2f maxFrameMs=%.2f loadedChunks=%d pending=%d triangles=%d chunkBuilds=%d avgChunkBuildMs=%.2f pos=(%.2f,%.2f,%.2f) grounded=%d swimming=%d cpu=%.1f%% mem=%.0fMB gpu=%.2fms",
             fps, avgMs, benchFrameMsMax,
             chunkManager.loadedChunks.count, chunkManager.pendingChunkCount, chunkManager.totalTriangleCount,
             chunkManager.totalChunksBuilt, chunkManager.averageChunkBuildMs,
             camera.position.x, camera.position.y, camera.position.z,
             playerController.isGrounded ? 1 : 0,
-            playerController.isSwimming ? 1 : 0
+            playerController.isSwimming ? 1 : 0,
+            cpuPercent, memoryMB, lastGPUFrameMs
         ))
 
         let posText = String(format: "%.1f, %.1f, %.1f", camera.position.x, camera.position.y, camera.position.z)
+        let totalMinutes = Int(gameHours * 60)
+        let timeText = String(format: "%02d:%02d", (totalMinutes / 60) % 24, totalMinutes % 60)
         let statsText = """
         FPS: \(Int(fps.rounded())) (\(String(format: "%.1f", avgMs)) ms)
         Pos: \(posText)
+        Time: \(timeText)
         Grounded: \(playerController.isGrounded ? "yes" : "no")   Swimming: \(playerController.isSwimming ? "yes" : "no")
         Third-person: \(camera.isThirdPerson ? "yes" : "no")
         Chunks: \(chunkManager.loadedChunks.count) loaded, \(chunkManager.pendingChunkCount) pending
         Triangles: \(chunkManager.totalTriangleCount)
+        CPU: \(String(format: "%.0f", cpuPercent))%   Mem: \(String(format: "%.0f", memoryMB)) MB
+        GPU: \(String(format: "%.2f", lastGPUFrameMs)) ms (\(String(format: "%.0f", gpuPercentOfFrame))% of frame)
         """
         onStatsUpdate?(statsText)
 
@@ -566,6 +734,34 @@ final class Renderer: NSObject, MTKViewDelegate {
         benchFrameCount = 0
         benchFrameMsSum = 0
         benchFrameMsMax = 0
+    }
+
+    /// MapView hook: the natural terrain color at this column — water blue
+    /// at/under sea level, otherwise whatever TerrainGenerator would surface
+    /// there. Deliberately ignores player edits (blockEdits): a map reads
+    /// the land, not which blocks you've personally dug or placed.
+    func terrainColor(x: Int, z: Int) -> SIMD3<Float> {
+        let info = terrainGenerator.columnInfo(x: x, z: z)
+        return info.height <= TerrainGenerator.seaLevel ? VoxelType.water.color : info.topBlock.color
+    }
+
+    /// Fire-and-forget: called after every break/place. The snapshot copy
+    /// (BlockEdits.allEdits, under its own lock) and the encode+write both
+    /// happen on saveQueue, off the main thread, so an edit never stalls a
+    /// frame waiting on disk I/O.
+    private func persistSave() {
+        saveQueue.async { [worldID, blockEdits] in
+            WorldStore.saveEdits(blockEdits.allEdits(), for: worldID)
+        }
+    }
+
+    /// Blocking variant for app shutdown/quit-to-title (see AppDelegate) —
+    /// there's no next frame to let an async persistSave finish on, so this
+    /// waits on saveQueue instead of just enqueueing onto it.
+    func saveNow() {
+        saveQueue.sync { [worldID, blockEdits] in
+            WorldStore.saveEdits(blockEdits.allEdits(), for: worldID)
+        }
     }
 
     /// Settings-menu hook: keeps unloadRadius a couple chunks past loadRadius
@@ -607,6 +803,47 @@ final class Renderer: NSObject, MTKViewDelegate {
         return nil
     }
 
+    private let animalHitReach: Float = 4.5
+    private let animalHitRadius: Float = 0.6
+
+    /// Nearest animal roughly along the camera's look direction within
+    /// reach — used to prioritize attacking over breaking whatever block is
+    /// behind it. Unlike raycastTargetBlock's voxel marching, this is just a
+    /// closest-point-to-ray check against each animal's body center, since
+    /// an animal isn't grid-aligned the way a block is.
+    private func targetedAnimal() -> Animal? {
+        let origin = camera.position
+        let direction = camera.front
+        var best: Animal?
+        var bestDistance = animalHitReach
+        for animal in animalManager.animals {
+            let bodyCenter = animal.position + SIMD3<Float>(0, 0.3, 0)
+            let toAnimal = bodyCenter - origin
+            let alongRay = dot(toAnimal, direction)
+            guard alongRay > 0, alongRay < bestDistance else { continue }
+            let closestPoint = origin + direction * alongRay
+            guard length(bodyCenter - closestPoint) < animalHitRadius else { continue }
+            bestDistance = alongRay
+            best = animal
+        }
+        return best
+    }
+
+    /// Left click, tried before breakTargetedBlock/updateSurvivalBreaking —
+    /// attacking works in both game modes (unlike block breaking's
+    /// creative-only instant break), matching the usual "same button hits
+    /// whatever you're looking at" convention. Returns whether an animal was
+    /// actually hit, so the caller knows not to also try breaking a block
+    /// this click.
+    @discardableResult
+    func attackTargetedAnimal() -> Bool {
+        guard !isPaused, let animal = targetedAnimal() else { return false }
+        let away = SIMD2<Float>(animal.position.x - camera.position.x, animal.position.z - camera.position.z)
+        let awayLength = length(away)
+        animal.hit(awayFromPlayer: awayLength > 0.0001 ? away / awayLength : SIMD2<Float>(0, 1))
+        return true
+    }
+
     /// Left click: in creative, removes whatever block the player is looking
     /// at instantly — no drop, matching "you already have infinite blocks."
     /// In survival, breaking instead happens gradually in updateSurvivalBreaking
@@ -616,6 +853,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         guard !isPaused, gameMode == .creative, let hit = raycastTargetBlock() else { return }
         blockEdits.set(BlockCoord(hit.block), to: .air)
         chunkManager.rebuildAffectedChunks(byEditAt: hit.block)
+        persistSave()
     }
 
     /// Right click: places the hotbar's selected block into the empty cell
@@ -624,7 +862,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     /// can't place anything.
     func placeBlock() {
         guard !isPaused, let hit = raycastTargetBlock(), let placeAt = hit.placeAt,
-              let selectedType = hotbar.selectedType else { return }
+              let selectedType = hotbar.selectedType,
+              selectedType.isSolid // tools/food/materials (map, meat, bones, ...) aren't real blocks
+        else { return }
 
         // Don't let the player wall themselves in.
         let playerColumnX = Int(camera.position.x.rounded(.down))
@@ -637,6 +877,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         blockEdits.set(BlockCoord(placeAt), to: selectedType)
         chunkManager.rebuildAffectedChunks(byEditAt: placeAt)
+        persistSave()
         if gameMode == .survival {
             hotbar.consumeSelected()
         }
@@ -675,6 +916,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         blockEdits.set(BlockCoord(hit.block), to: .air)
         chunkManager.rebuildAffectedChunks(byEditAt: hit.block)
+        persistSave()
         droppedItems.append(DroppedItem(
             type: type,
             position: SIMD3<Float>(Float(hit.block.x) + 0.5, Float(hit.block.y) + 0.5, Float(hit.block.z) + 0.5),
@@ -682,6 +924,29 @@ final class Renderer: NSObject, MTKViewDelegate {
         ))
         breakingTarget = nil
         breakingProgress = 0
+    }
+
+    /// Called once per killed animal (see draw(in:)'s removeDeadAnimals
+    /// loop) — a bit of meat plus a chance at a bone, dropped as ordinary
+    /// DroppedItems so they fall/get picked up exactly like anything broken
+    /// out of terrain.
+    private func spawnAnimalDrops(for animal: Animal) {
+        let meatType: VoxelType
+        switch animal.type {
+        case .pig: meatType = .rawPork
+        case .sheep: meatType = .rawMutton
+        case .chicken: meatType = .rawChicken
+        }
+
+        var drops = Array(repeating: meatType, count: Int.random(in: 1...2))
+        if Float.random(in: 0...1) < 0.35 {
+            drops.append(.bone)
+        }
+
+        for drop in drops {
+            let scatter = SIMD3<Float>(Float.random(in: -0.2...0.2), 0.3, Float.random(in: -0.2...0.2))
+            droppedItems.append(DroppedItem(type: drop, position: animal.position + scatter, spawnTime: CACurrentMediaTime()))
+        }
     }
 
     /// The nearest solid surface at or below `y` in this column, scanning
@@ -766,6 +1031,31 @@ final class Renderer: NSObject, MTKViewDelegate {
         draw(ChunkGeometry(vertexBuffer: vertexBuffer, indexBuffer: indexBuffer, indexCount: indices.count), with: encoder)
     }
 
+    // Rebuilt fresh every frame from AnimalManager's current list — same
+    // reasoning as dropped items/PlayerModel: cheap enough per-frame that a
+    // persistent buffer per animal isn't worth the bookkeeping, especially
+    // since the population itself changes as animals spawn/despawn.
+    private func drawAnimals(with encoder: MTLRenderCommandEncoder) {
+        let animals = animalManager.animals
+        guard !animals.isEmpty else { return }
+        var vertices: [Vertex] = []
+        var indices: [UInt32] = []
+        for animal in animals {
+            let (animalVertices, animalIndices) = AnimalMesh.buildMesh(
+                type: animal.type, feetPosition: animal.position, yaw: animal.yaw, walkBobPhase: animal.walkBobPhase,
+                hitFlash: animal.hitFlashIntensity
+            )
+            let start = UInt32(vertices.count)
+            vertices.append(contentsOf: animalVertices)
+            indices.append(contentsOf: animalIndices.map { $0 + start })
+        }
+        guard let vertexBuffer = device.makeBuffer(bytes: vertices, length: MemoryLayout<Vertex>.stride * vertices.count, options: .storageModeShared),
+              let indexBuffer = device.makeBuffer(bytes: indices, length: MemoryLayout<UInt32>.stride * indices.count, options: .storageModeShared) else {
+            return
+        }
+        draw(ChunkGeometry(vertexBuffer: vertexBuffer, indexBuffer: indexBuffer, indexCount: indices.count), with: encoder)
+    }
+
     // Rebuilt fresh every frame around whatever block is targeted (see
     // BlockHighlight) — trivially cheap (24 vertices), so no need to cache.
     // `progress` (0...1, only nonzero mid-survival-break) shifts the outline
@@ -786,6 +1076,46 @@ final class Renderer: NSObject, MTKViewDelegate {
         encoder.setDepthStencilState(waterDepthState) // test-but-don't-write, shared with the water pass
         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: vertices.count)
+    }
+
+    /// A flat billboard quad facing the camera, positioned `distance` away
+    /// along `direction` — reuses the unlit/unfogged highlight pipeline (see
+    /// vertex_highlight/fragment_highlight) rather than needing a dedicated
+    /// shader, since a flat, un-shaded, distance-independent color is
+    /// exactly what both already do. Shared by the sun and moon (see
+    /// call site) — same geometry, just a different direction/size/color.
+    private func drawCelestialBody(direction: SIMD3<Float>, distance: Float, size: Float, color: SIMD3<Float>, with encoder: MTLRenderCommandEncoder) {
+        let worldUp = SIMD3<Float>(0, 1, 0)
+        // Guards the near-vertical case (straight up/down) where
+        // cross(worldUp, direction) would be near-zero and normalize would
+        // blow up — arbitrary fixed right vector works fine there since the
+        // quad's own orientation around a purely vertical axis is invisible.
+        let right = length(cross(worldUp, direction)) > 0.001 ? normalize(cross(worldUp, direction)) : SIMD3<Float>(1, 0, 0)
+        let up = cross(direction, right)
+
+        let center = camera.position + direction * distance
+        let half = size / 2
+        let topLeft = center - right * half + up * half
+        let topRight = center + right * half + up * half
+        let bottomLeft = center - right * half - up * half
+        let bottomRight = center + right * half - up * half
+
+        let vertices = [
+            Vertex(position: topLeft, normal: .zero, color: color),
+            Vertex(position: bottomLeft, normal: .zero, color: color),
+            Vertex(position: bottomRight, normal: .zero, color: color),
+            Vertex(position: topLeft, normal: .zero, color: color),
+            Vertex(position: bottomRight, normal: .zero, color: color),
+            Vertex(position: topRight, normal: .zero, color: color),
+        ]
+        guard let vertexBuffer = device.makeBuffer(bytes: vertices, length: MemoryLayout<Vertex>.stride * vertices.count, options: .storageModeShared) else {
+            return
+        }
+        encoder.setRenderPipelineState(highlightPipelineState)
+        encoder.setDepthStencilState(waterDepthState) // test-but-don't-write — see the call site's doc comment on why that's fine
+        encoder.setCullMode(.none) // winding flips depending on position; not worth tracking, it's a flat billboard either way
+        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count)
     }
 
     // Rebuilt fresh every frame in world space (see PlayerModel) — small

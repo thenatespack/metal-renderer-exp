@@ -29,6 +29,14 @@ final class ChunkManager {
 
     private(set) var loadedChunks: [ChunkCoord: Chunk] = [:]
     private var pendingCoords: Set<ChunkCoord> = []
+    // Last update()'s position, purely to derive moveDirection below —
+    // nothing else needs a history of where the player's been.
+    private var previousPosition: SIMD3<Float>?
+    // How strongly movement direction reorders the (still primarily
+    // distance-based) build queue — 0 would be pure nearest-first, 1 would
+    // let a far chunk dead ahead completely leapfrog a near one directly
+    // behind. See priority(of:centerX:centerZ:moveDirection:).
+    private static let directionalBiasStrength: Float = 0.6
 
     private let buildQueue = DispatchQueue(label: "com.metalrenderer.chunkbuild", qos: .userInitiated, attributes: .concurrent)
 
@@ -56,6 +64,22 @@ final class ChunkManager {
         let centerX = Int(floor(worldPosition.x / Float(chunkSize)))
         let centerZ = Int(floor(worldPosition.z / Float(chunkSize)))
 
+        // Horizontal heading since the last call — used below to prioritize
+        // chunks the player is actually walking toward over ones directly
+        // behind them. Tiny deltas (standing still, or paused — update()
+        // still runs every frame regardless of Renderer.isPaused) are
+        // ignored rather than treated as a real direction, which would
+        // otherwise jitter the sort order for no reason.
+        var moveDirection = SIMD2<Float>(0, 0)
+        if let previousPosition {
+            let delta = SIMD2<Float>(worldPosition.x - previousPosition.x, worldPosition.z - previousPosition.z)
+            let lengthSq = delta.x * delta.x + delta.y * delta.y
+            if lengthSq > 0.0001 {
+                moveDirection = delta / lengthSq.squareRoot()
+            }
+        }
+        previousPosition = worldPosition
+
         for coord in loadedChunks.keys where max(abs(coord.x - centerX), abs(coord.z - centerZ)) > unloadRadius {
             loadedChunks.removeValue(forKey: coord)
         }
@@ -71,17 +95,34 @@ final class ChunkManager {
         }
         guard !missing.isEmpty else { return }
 
-        // Nearest-first so, under load, the chunks right around the camera
-        // tend to finish (and thus appear) before farther-out ones.
-        missing.sort { a, b in
-            let da = (a.x - centerX) * (a.x - centerX) + (a.z - centerZ) * (a.z - centerZ)
-            let db = (b.x - centerX) * (b.x - centerX) + (b.z - centerZ) * (b.z - centerZ)
-            return da < db
+        // Nearest-first, biased toward whatever's ahead of moveDirection —
+        // under load, this gets the world the player is about to walk into
+        // finished before ones directly behind, instead of a purely radial
+        // order that treats every direction the same regardless of heading.
+        missing.sort {
+            priority(of: $0, centerX: centerX, centerZ: centerZ, moveDirection: moveDirection)
+                < priority(of: $1, centerX: centerX, centerZ: centerZ, moveDirection: moveDirection)
         }
 
         for coord in missing {
             dispatchBuild(coord)
         }
+    }
+
+    /// Lower sorts sooner. Base cost is ordinary squared distance from the
+    /// player; alignment with moveDirection then discounts that cost for
+    /// chunks ahead (dot product near 1) and inflates it for chunks behind
+    /// (near -1), scaled by the chunk's own distance so the bias barely
+    /// matters for chunks already right next to the player either way.
+    private func priority(of coord: ChunkCoord, centerX: Int, centerZ: Int, moveDirection: SIMD2<Float>) -> Float {
+        let dx = Float(coord.x - centerX)
+        let dz = Float(coord.z - centerZ)
+        let distanceSq = dx * dx + dz * dz
+        guard distanceSq > 0, moveDirection.x != 0 || moveDirection.y != 0 else { return distanceSq }
+
+        let toChunk = SIMD2<Float>(dx, dz) / distanceSq.squareRoot()
+        let alignment = toChunk.x * moveDirection.x + toChunk.y * moveDirection.y // -1...1
+        return distanceSq * (1 - Self.directionalBiasStrength * alignment)
     }
 
     /// Re-meshes whichever currently-loaded chunks a block edit at this

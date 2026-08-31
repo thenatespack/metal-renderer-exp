@@ -44,20 +44,29 @@ final class InventoryView: NSView, ControllerMenuNavigable {
     // Materials columns matches Hotbar.hotbarSlotCount exactly, so the first
     // row is precisely the wieldable hotbar and any further rows are
     // inventory-only overflow — see the divider line in drawMaterialsAndCrafting.
+    // Always drawn as a full materialsRows x materialsColumns grid (padded
+    // with empty cells past however many slots actually exist), fitting
+    // Hotbar.slotCount's 21 real slots with room to grow.
     private let materialsColumns = Hotbar.hotbarSlotCount
-    private let slotSize: CGFloat = 42
+    private let materialsRows = 3
+    private let slotSize: CGFloat = 40
     private let slotSpacing: CGFloat = 8
+    // Vertical-only gap between Materials rows — wider than slotSpacing
+    // (which stays tight for the horizontal gutters) because each filled
+    // slot draws its item name in the space just below it; at slotSpacing's
+    // width alone that label collided with the row beneath it.
+    private let materialsRowSpacing: CGFloat = 22
     private let craftCellSize: CGFloat = 52
     private let craftCellSpacing: CGFloat = 10
-    private let bookColumns = 3
+    private let bookColumns = 4
     private let bookCellSize: CGFloat = 60
     private let bookCellSpacing: CGFloat = 14
 
     private let leftColumnWidth: CGFloat = 540
-    private let rightColumnWidth: CGFloat = 340
+    private let rightColumnWidth: CGFloat = 360
     private let columnGap: CGFloat = 70
-    private let leftPanelHeight: CGFloat = 450
-    private let rightPanelHeight: CGFloat = 330
+    private let leftPanelHeight: CGFloat = 520
+    private let rightPanelHeight: CGFloat = 360
     private let panelCornerRadius: CGFloat = 10
 
     init(frame frameRect: NSRect, hotbar: Hotbar) {
@@ -99,7 +108,7 @@ final class InventoryView: NSView, ControllerMenuNavigable {
             return
         }
 
-        if let index = hotbarSlotRects.firstIndex(where: { $0.contains(point) }), let type = slots[index].type {
+        if let index = hotbarSlotRects.firstIndex(where: { $0.contains(point) }), slots.indices.contains(index), let type = slots[index].type {
             dragSourceSlotIndex = index
             dragType = type
             dragPoint = point
@@ -209,11 +218,14 @@ final class InventoryView: NSView, ControllerMenuNavigable {
 
     // MARK: Layout helpers
 
-    private func cellRect(index: Int, columns: Int, size: CGFloat, spacing: CGFloat, left: CGFloat, top: CGFloat) -> CGRect {
+    /// `rowSpacing` defaults to the column `spacing` — pass a larger value
+    /// for a grid whose cells draw something (like Materials' name labels)
+    /// below them that needs more room than a tight column gutter gives.
+    private func cellRect(index: Int, columns: Int, size: CGFloat, spacing: CGFloat, left: CGFloat, top: CGFloat, rowSpacing: CGFloat? = nil) -> CGRect {
         let row = index / columns
         let col = index % columns
         let x = left + CGFloat(col) * (size + spacing)
-        let y = top - CGFloat(row + 1) * size - CGFloat(row) * spacing
+        let y = top - CGFloat(row + 1) * size - CGFloat(row) * (rowSpacing ?? spacing)
         return CGRect(x: x, y: y, width: size, height: size)
     }
 
@@ -279,21 +291,27 @@ final class InventoryView: NSView, ControllerMenuNavigable {
         let padding: CGFloat = 18
         var cursorY = drawSectionHeader("Materials — top row is the hotbar (1\u{2013}9, 0)", x: panel.minX + padding, y: panel.maxY - padding - 16)
 
+        // Always a full materialsRows x materialsColumns grid, padded out
+        // with empty cells past however many slots actually exist — a
+        // partial last row reads as a layout bug, not "you're just not
+        // carrying that much yet."
+        let totalCells = materialsRows * materialsColumns
         let materialsWidth = gridWidth(columns: materialsColumns, size: slotSize, spacing: slotSpacing)
         let materialsLeft = panel.minX + (panel.width - materialsWidth) / 2
-        let materialsHeight = CGFloat((slots.count + materialsColumns - 1) / materialsColumns) * (slotSize + slotSpacing) - slotSpacing
+        let materialsHeight = CGFloat(materialsRows) * (slotSize + materialsRowSpacing) - materialsRowSpacing
 
         let nameAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.white.withAlphaComponent(0.85)]
-        hotbarSlotRects = Array(repeating: .zero, count: slots.count)
-        for (index, slot) in slots.enumerated() {
-            let rect = cellRect(index: index, columns: materialsColumns, size: slotSize, spacing: slotSpacing, left: materialsLeft, top: cursorY)
+        hotbarSlotRects = Array(repeating: .zero, count: totalCells)
+        for index in 0..<totalCells {
+            let slot: HotbarSlot? = slots.indices.contains(index) ? slots[index] : nil
+            let rect = cellRect(index: index, columns: materialsColumns, size: slotSize, spacing: slotSpacing, left: materialsLeft, top: cursorY, rowSpacing: materialsRowSpacing)
             hotbarSlotRects[index] = rect
 
             context.setFillColor(NSColor.black.withAlphaComponent(0.5).cgColor)
             context.fill(rect.insetBy(dx: -3, dy: -3))
 
             // While dragging, the source slot shows empty (the item follows the cursor instead).
-            if let type = slot.type, index != dragSourceSlotIndex {
+            if let slot, let type = slot.type, index != dragSourceSlotIndex {
                 fillSwatch(type, in: rect, context: context)
                 let countText: String? = slot.count < 0 ? "\u{221E}" : (slot.count > 1 ? "\(slot.count)" : nil)
                 if let countText {
@@ -307,8 +325,8 @@ final class InventoryView: NSView, ControllerMenuNavigable {
                 context.stroke(rect.insetBy(dx: -3, dy: -3))
             }
 
-            if slot.type != nil {
-                let labelText = (slot.type?.displayName ?? "") as NSString
+            if let type = slot?.type {
+                let labelText = type.displayName as NSString
                 let labelSize = labelText.size(withAttributes: nameAttrs)
                 if labelSize.width <= slotSize + 6 {
                     labelText.draw(at: NSPoint(x: rect.midX - labelSize.width / 2, y: rect.minY - 12), withAttributes: nameAttrs)
@@ -320,7 +338,7 @@ final class InventoryView: NSView, ControllerMenuNavigable {
         // rows below it — materialsColumns == Hotbar.hotbarSlotCount, so the
         // hotbar always fills exactly the first row.
         if slots.count > Hotbar.hotbarSlotCount {
-            let dividerY = cursorY - slotSize - slotSpacing / 2
+            let dividerY = cursorY - slotSize - materialsRowSpacing / 2
             context.setStrokeColor(NSColor.white.withAlphaComponent(0.25).cgColor)
             context.setLineWidth(1)
             context.move(to: CGPoint(x: materialsLeft, y: dividerY))

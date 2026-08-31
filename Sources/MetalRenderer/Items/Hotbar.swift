@@ -5,8 +5,8 @@ struct HotbarSlot {
     var count: Int
 }
 
-/// The player's full item storage: one slot per block type (7 raw materials
-/// + 9 craftable ones — see CraftingRecipe). Only the first `hotbarSlotCount`
+/// The player's full item storage: one slot per item type (7 raw materials
+/// + 10 craftable ones — see CraftingRecipe). Only the first `hotbarSlotCount`
 /// slots are the actual hotbar — wieldable, shown in the HUD bar, selected
 /// with number keys 1...9/0 or shoulder buttons (edge-triggered, same
 /// one-shot pattern as the third-person toggle). The remaining slots are
@@ -21,9 +21,14 @@ final class Hotbar {
     private static let creativeLoadout: [VoxelType] = [
         .grass, .dirt, .stone, .sand, .wood, .leaves, .snow,
         .planks, .stoneBricks, .mudBricks, .packedSnow, .thatch,
-        .polishedStone, .sandstone, .reinforcedPlanks, .packedDirt,
+        .polishedStone, .sandstone, .reinforcedPlanks, .packedDirt, .map,
     ]
-    static let slotCount = 16
+    // 17 raw+crafted block/tool types (creativeLoadout) plus 4 animal-drop
+    // items (bone, rawPork, rawMutton, rawChicken — see VoxelType) that
+    // survival can pick up but creative doesn't start with: total storage
+    // needs room for every distinct type a player could simultaneously hold,
+    // not just creativeLoadout's own count.
+    static let slotCount = 21
     /// Wieldable range: indices [0, hotbarSlotCount) — matches KeyCode.digits
     /// (1...9, 0) and what HotbarView draws in the HUD.
     static let hotbarSlotCount = 10

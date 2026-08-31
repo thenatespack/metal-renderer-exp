@@ -10,7 +10,7 @@ struct CraftingRecipe {
 }
 
 enum CraftingRecipes {
-    /// Nine recipes, fitting a 3x3 recipe-book grid (see InventoryView),
+    /// Ten recipes, fitting a 4-column recipe-book grid (see InventoryView),
     /// deliberately varied: single-ingredient multipliers, 1:1 "refines",
     /// genuine multi-ingredient combines, and — for stoneBricks -> polished
     /// stone / planks+stone -> reinforced planks — recipes that consume a
@@ -32,5 +32,9 @@ enum CraftingRecipes {
             resultType: .reinforcedPlanks, resultCount: 2
         ),
         CraftingRecipe(ingredients: [CraftingIngredient(type: .dirt, count: 4)], resultType: .packedDirt, resultCount: 2),
+        CraftingRecipe(
+            ingredients: [CraftingIngredient(type: .planks, count: 2), CraftingIngredient(type: .sand, count: 4)],
+            resultType: .map, resultCount: 1
+        ),
     ]
 }

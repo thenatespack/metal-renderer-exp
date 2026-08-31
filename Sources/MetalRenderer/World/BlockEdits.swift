@@ -1,7 +1,7 @@
 import simd
 import Foundation
 
-struct BlockCoord: Hashable {
+struct BlockCoord: Hashable, Codable {
     let x: Int
     let y: Int
     let z: Int
@@ -41,6 +41,21 @@ final class BlockEdits {
         lock.lock()
         defer { lock.unlock() }
         return edits[coord]
+    }
+
+    /// Bulk-replaces every edit — used once at startup to restore a save
+    /// file, before any chunk has been built or any query made against this.
+    func load(_ savedEdits: [BlockCoord: VoxelType]) {
+        lock.lock()
+        edits = savedEdits
+        lock.unlock()
+    }
+
+    /// A full copy of every edit — used by SaveGame to persist the world.
+    func allEdits() -> [BlockCoord: VoxelType] {
+        lock.lock()
+        defer { lock.unlock() }
+        return edits
     }
 
     /// A snapshot of edits within an inclusive (x, z) column range, copied

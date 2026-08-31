@@ -1,6 +1,6 @@
 import simd
 
-enum VoxelType: UInt8 {
+enum VoxelType: UInt8, Codable {
     case air = 0
     case grass
     case dirt
@@ -22,8 +22,20 @@ enum VoxelType: UInt8 {
     case sandstone
     case reinforcedPlanks
     case packedDirt
+    // A tool, not a block: crafted and carried like any other item, but not
+    // solid (so it can't be placed as terrain — see Renderer.placeBlock) and
+    // never targeted by breaking. Using it opens MapView instead (the M key,
+    // gated on holding at least one — see AppDelegate.toggleMap).
+    case map
+    // Dropped by animals on death (see Renderer.spawnAnimalDrops) — items,
+    // not blocks: same non-solid/non-placeable treatment as .map.
+    case bone
+    case rawPork
+    case rawMutton
+    case rawChicken
 
-    var isSolid: Bool { self != .air }
+    private static let nonSolidTypes: Set<VoxelType> = [.air, .map, .bone, .rawPork, .rawMutton, .rawChicken]
+    var isSolid: Bool { !Self.nonSolidTypes.contains(self) }
 
     var color: SIMD3<Float> {
         switch self {
@@ -45,6 +57,11 @@ enum VoxelType: UInt8 {
         case .sandstone:         return SIMD3<Float>(0.80, 0.72, 0.52)
         case .reinforcedPlanks:  return SIMD3<Float>(0.50, 0.40, 0.30)
         case .packedDirt:        return SIMD3<Float>(0.35, 0.24, 0.15)
+        case .map:               return SIMD3<Float>(0.82, 0.74, 0.52)
+        case .bone:              return SIMD3<Float>(0.90, 0.87, 0.76)
+        case .rawPork:           return SIMD3<Float>(0.88, 0.58, 0.58)
+        case .rawMutton:         return SIMD3<Float>(0.78, 0.38, 0.40)
+        case .rawChicken:        return SIMD3<Float>(0.92, 0.72, 0.68)
         }
     }
 
@@ -57,7 +74,7 @@ enum VoxelType: UInt8 {
         case .wood, .planks, .reinforcedPlanks: return 0.8
         case .leaves, .thatch: return 0.25
         case .grass, .dirt, .sand, .snow, .mudBricks, .packedSnow, .sandstone, .packedDirt: return 0.4
-        case .air, .water: return 0.4
+        case .air, .water, .map, .bone, .rawPork, .rawMutton, .rawChicken: return 0.4
         }
     }
 
@@ -82,6 +99,11 @@ enum VoxelType: UInt8 {
         case .sandstone:         return "Sandstone"
         case .reinforcedPlanks:  return "Reinforced Planks"
         case .packedDirt:        return "Packed Dirt"
+        case .map:               return "Map"
+        case .bone:              return "Bone"
+        case .rawPork:           return "Raw Pork"
+        case .rawMutton:         return "Raw Mutton"
+        case .rawChicken:        return "Raw Chicken"
         }
     }
 }

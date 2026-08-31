@@ -8,7 +8,7 @@ final class DebugOverlayView: NSView {
 
     private let label = NSTextField(wrappingLabelWithString: "")
     private let labelWidth: CGFloat = 260
-    private let labelHeight: CGFloat = 100
+    private let labelHeight: CGFloat = 148
     private let inset: CGFloat = 10
 
     override init(frame frameRect: NSRect) {

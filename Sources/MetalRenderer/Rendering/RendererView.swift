@@ -10,6 +10,7 @@ final class RendererView: MTKView {
     var onEscape: (() -> Void)?
     var onToggleDebugOverlay: (() -> Void)?
     var onToggleInventory: (() -> Void)?
+    var onToggleMap: (() -> Void)?
     var onBreakBlock: (() -> Void)?
     var onPlaceBlock: (() -> Void)?
 
@@ -46,6 +47,9 @@ final class RendererView: MTKView {
             return
         case KeyCode.i:
             onToggleInventory?()
+            return
+        case KeyCode.m:
+            onToggleMap?()
             return
         default:
             break

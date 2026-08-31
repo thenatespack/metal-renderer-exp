@@ -137,6 +137,11 @@ final class SettingsMenuView: NSView, ControllerMenuNavigable {
             view.wantsLayer = true
             view.layer?.cornerRadius = 6
         }
+        // Real NSButton needs its own solid fill on top of the above — see
+        // stylePillButton's doc comment for why wantsLayer alone leaves it
+        // see-through. The other controls (segmented/slider/popup) don't
+        // share that bug, so they're left with just the generic loop above.
+        backButton.stylePillButton()
 
         let stack = NSStackView(views: [
             title,

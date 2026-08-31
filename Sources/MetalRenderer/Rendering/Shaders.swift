@@ -92,8 +92,18 @@ enum Shaders {
         float4 worldPosition = uniforms.modelMatrix * float4(in.position, 1.0);
 
         if (in.normal.y > 0.5) {
-            float wave = sin(worldPosition.x * 0.5 + uniforms.time * 1.3) * 0.02
-                       + sin(worldPosition.z * 0.4 + uniforms.time * 1.7) * 0.02;
+            // Sampled at the block's own center, not this exact vertex —
+            // a top face's 4 corners sit at different x/z, so waving each
+            // one by its own position bends the quad out of plane every
+            // frame. Since every quad is split into its two triangles along
+            // the same fixed diagonal (see VoxelMesher), that non-planarity
+            // shows up as a consistent diagonal crease across the whole
+            // water surface. Using one shared value per block keeps each
+            // quad flat — still one independent wave per water block, just
+            // not warped internally.
+            float2 blockCenter = floor(worldPosition.xz) + 0.5;
+            float wave = sin(blockCenter.x * 0.5 + uniforms.time * 1.3) * 0.02
+                       + sin(blockCenter.y * 0.4 + uniforms.time * 1.7) * 0.02;
             worldPosition.y += wave - 0.12;
         }
 

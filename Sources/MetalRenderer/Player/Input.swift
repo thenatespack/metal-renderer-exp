@@ -8,6 +8,7 @@ enum KeyCode {
     static let c: UInt16 = 8
     static let h: UInt16 = 4
     static let i: UInt16 = 34
+    static let m: UInt16 = 46
     static let escape: UInt16 = 53
     // Standard ANSI number-row codes — not sequential, so listed explicitly.
     // Order matches the hotbar's 10 slots: 1...9, then 0.

@@ -46,6 +46,10 @@ final class PlayerController {
     var jumpSpeed: Float = 8
     var gravity: Float = 22
     var maxStepHeight: Float = 1.1
+    /// How much clearance horizontal movement keeps from solid geometry —
+    /// see tryMove's doc comment for why this needs to comfortably exceed
+    /// the camera's near clip plane (0.1).
+    var collisionRadius: Float = 0.3
     var thirdPersonCameraStep: Float = 0.15
     var minThirdPersonPullback: Float = 0.15
 
@@ -118,17 +122,66 @@ final class PlayerController {
             func tryMove(_ dx: Float, _ dz: Float) -> Bool {
                 let newX = camera.position.x + dx
                 let newZ = camera.position.z + dz
+
+                // Obstruction is checked a further collisionRadius past the
+                // actual destination, in the same direction of travel — not
+                // just at the destination itself. A zero-radius point check
+                // lets the camera walk right up to a wall's face with zero
+                // clearance, and the camera's near clip plane (0.1 units,
+                // see Renderer's projection matrix) can then poke past that
+                // face into the block's interior, which the renderer clips
+                // away entirely — you end up seeing whatever is behind the
+                // wall instead of the wall itself. Checking further ahead
+                // means movement stops collisionRadius short of the wall
+                // instead of flush against it, keeping the camera safely
+                // outside clipping range.
+                let moveLength = (dx * dx + dz * dz).squareRoot()
+                let checkX: Float
+                let checkZ: Float
+                if moveLength > 0.0001 {
+                    checkX = newX + (dx / moveLength) * collisionRadius
+                    checkZ = newZ + (dz / moveLength) * collisionRadius
+                } else {
+                    checkX = newX
+                    checkZ = newZ
+                }
+
                 // Underwater, stepping toward deeper/shallower ground is just
                 // swimming, not climbing — only the dry-land step limit applies.
-                guard isSwimming || groundHeight(newX, newZ) - currentGround <= maxStepHeight else { return false }
-                guard !isObstructed(newX, newZ) else { return false }
+                guard isSwimming || groundHeight(checkX, checkZ) - currentGround <= maxStepHeight else { return false }
+                guard !isObstructed(checkX, checkZ) else { return false }
+                // isObstructed only looks at the checked column's own ground
+                // height — it has no idea about a block overhanging from
+                // elsewhere (a ledge, a branch, something placed) that
+                // doesn't match that column's natural surface. A direct
+                // check at the player's own current feet/head height catches
+                // that case too, independent of what that column's ground
+                // height happens to be.
+                guard !isSolidAt(checkX, camera.position.y - eyeHeight + 0.1, checkZ),
+                      !isSolidAt(checkX, camera.position.y - 0.1, checkZ) else { return false }
                 camera.position.x = newX
                 camera.position.z = newZ
                 return true
             }
 
-            let dx = moveDir.x * speed * deltaTime
-            let dz = moveDir.z * speed * deltaTime
+            // Capped so a large single-frame deltaTime (a stutter while
+            // chunks are building — easily hundreds of ms, per the [bench]
+            // log) can't move the player more than a fraction of a block in
+            // one step. tryMove only checks the final destination, not
+            // anything in between, so a big enough jump could otherwise
+            // land inside a wall's own solid interior — and once there,
+            // hardware back-face culling makes every face of the block
+            // you're standing inside invisible (they all face away from an
+            // interior viewpoint), which reads as seeing straight through it.
+            let maxMovePerFrame: Float = 0.9
+            var dx = moveDir.x * speed * deltaTime
+            var dz = moveDir.z * speed * deltaTime
+            let moveLength = (dx * dx + dz * dz).squareRoot()
+            if moveLength > maxMovePerFrame {
+                let scale = maxMovePerFrame / moveLength
+                dx *= scale
+                dz *= scale
+            }
             if !tryMove(dx, dz) {
                 if !tryMove(dx, 0) {
                     _ = tryMove(0, dz)
