@@ -20,6 +20,7 @@ final class MainMenuView: NSView, ControllerMenuNavigable {
 
     private let worldsStack = NSStackView()
     private let nameField = NSTextField()
+    private let seedField = NSTextField()
     private let createButton = NSButton(title: "Create World", target: nil, action: nil)
     private let playButton = NSButton(title: "Play", target: nil, action: nil)
     private let deleteButton = NSButton(title: "Delete", target: nil, action: nil)
@@ -75,7 +76,12 @@ final class MainMenuView: NSView, ControllerMenuNavigable {
         nameField.placeholderString = "New world name"
         nameField.target = self
         nameField.action = #selector(createTapped) // Return key in the field also creates
-        nameField.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        nameField.widthAnchor.constraint(equalToConstant: 190).isActive = true
+
+        seedField.placeholderString = "Seed (optional, random)"
+        seedField.target = self
+        seedField.action = #selector(createTapped) // Return key in the field also creates
+        seedField.widthAnchor.constraint(equalToConstant: 160).isActive = true
 
         createButton.target = self
         createButton.action = #selector(createTapped)
@@ -87,7 +93,7 @@ final class MainMenuView: NSView, ControllerMenuNavigable {
         quitButton.target = self
         quitButton.action = #selector(quitTapped)
 
-        let createRow = NSStackView(views: [nameField, createButton])
+        let createRow = NSStackView(views: [nameField, seedField, createButton])
         createRow.orientation = .horizontal
         createRow.spacing = 8
 
@@ -188,10 +194,28 @@ final class MainMenuView: NSView, ControllerMenuNavigable {
     @objc private func createTapped() {
         let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        let world = WorldStore.createWorld(name: name)
+        let world = WorldStore.createWorld(name: name, seed: Self.parseSeed(seedField.stringValue))
         nameField.stringValue = ""
+        seedField.stringValue = ""
         selectedWorldID = world.id
         refreshWorlds()
+    }
+
+    /// Blank means "no preference" (WorldStore picks a fresh random seed).
+    /// A plain number is used as-is; any other text is hashed into one
+    /// (FNV-1a, stable across launches) so a word or phrase works as a seed
+    /// too, the same "type anything" convention Minecraft's own seed field
+    /// uses, rather than requiring players to type a raw 64-bit number.
+    private static func parseSeed(_ text: String) -> UInt64? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let value = UInt64(trimmed) { return value }
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in trimmed.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return hash
     }
 
     @objc private func playTapped() {

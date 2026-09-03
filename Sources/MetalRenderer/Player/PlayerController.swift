@@ -63,6 +63,18 @@ final class PlayerController {
     private(set) var isGrounded = false
     private(set) var isSwimming = false
 
+    /// Highest camera.position.y reached since last grounded — the peak, not
+    /// the launch point, is what makes a fall damaging (covers walking off a
+    /// ledge, not just jumping). nil means "not currently airborne-tracked"
+    /// (grounded, or was just reset by entering water).
+    private var peakAirborneY: Float?
+    /// True only on the single frame isGrounded flips false -> true — see
+    /// Renderer, which reads this once per frame to apply fall damage.
+    private(set) var justLanded = false
+    /// Set alongside justLanded on that same landing frame — how far above
+    /// the landing point the player's peak height was.
+    private(set) var lastFallDistance: Float = 0
+
     init(
         camera: Camera,
         groundHeight: @escaping (Float, Float) -> Float,
@@ -78,6 +90,8 @@ final class PlayerController {
     }
 
     func update(input: InputController, deltaTime: Float) {
+        let wasGrounded = isGrounded
+
         if input.consumeKeyPress(KeyCode.c) {
             camera.isThirdPerson.toggle()
         }
@@ -97,11 +111,16 @@ final class PlayerController {
         // often be, treading water at the surface.
         let feetY = camera.position.y - eyeHeight
         let waterTop = waterSurfaceHeight(camera.position.x, camera.position.z)
+        let wasSwimming = isSwimming
         if let waterTop {
             isSwimming = isSwimming ? feetY < waterTop + swimHysteresis : feetY < waterTop - swimHysteresis
         } else {
             isSwimming = false
         }
+        // Diving into water cancels an in-progress fall — standard genre
+        // convention (landing in a lake shouldn't hurt), and simpler than
+        // tracking depth-of-entry as its own damage variable.
+        if isSwimming && !wasSwimming { peakAirborneY = nil }
 
         let flatFront = SIMD3<Float>(sin(camera.yaw), 0, -cos(camera.yaw))
         let flatRight = SIMD3<Float>(cos(camera.yaw), 0, sin(camera.yaw))
@@ -225,6 +244,17 @@ final class PlayerController {
         }
 
         camera.thirdPersonPullback = camera.isThirdPerson ? resolveThirdPersonPullback() : 1
+
+        if isGrounded {
+            justLanded = !wasGrounded
+            if justLanded {
+                lastFallDistance = max(0, (peakAirborneY ?? camera.position.y) - camera.position.y)
+            }
+            peakAirborneY = nil
+        } else {
+            peakAirborneY = max(peakAirborneY ?? camera.position.y, camera.position.y)
+            justLanded = false
+        }
     }
 
     /// Marches from the player out along the third-person offset direction,

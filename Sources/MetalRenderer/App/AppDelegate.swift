@@ -21,7 +21,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var settingsMenuView: SettingsMenuView!
     var debugOverlayView: DebugOverlayView!
     var hotbarView: HotbarView!
+    var vitalsView: VitalsView!
     var breakProgressView: BreakProgressView!
+    var toastView: ToastView!
     var inventoryView: InventoryView!
     var mapView: MapView!
     var gameControllerManager: GameControllerManager!
@@ -131,9 +133,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotbarView.autoresizingMask = [.width, .height]
         mtkView.addSubview(hotbarView)
 
+        vitalsView = VitalsView(frame: mtkView.bounds)
+        vitalsView.autoresizingMask = [.width, .height]
+        vitalsView.isHidden = renderer.gameMode == .creative
+        mtkView.addSubview(vitalsView)
+
         breakProgressView = BreakProgressView(frame: mtkView.bounds)
         breakProgressView.autoresizingMask = [.width, .height]
         mtkView.addSubview(breakProgressView)
+
+        toastView = ToastView(frame: mtkView.bounds)
+        toastView.autoresizingMask = [.width, .height]
+        mtkView.addSubview(toastView)
 
         inventoryView = InventoryView(frame: mtkView.bounds, hotbar: renderer.hotbar)
         inventoryView.autoresizingMask = [.width, .height]
@@ -160,6 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsMenuView.onGameModeChanged = { [weak self] mode in
             self?.renderer.setGameMode(mode)
+            self?.vitalsView.isHidden = mode == .creative
         }
         settingsMenuView.onResolutionScaleChanged = { [weak self] scale in
             self?.currentResolutionScale = scale
@@ -187,22 +199,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mtkView.onToggleInventory = { [weak self] in self?.toggleInventory() }
         mtkView.onToggleMap = { [weak self] in self?.toggleMap() }
         mtkView.onBreakBlock = { [weak self] in self?.attackOrBreak() }
-        mtkView.onPlaceBlock = { [weak self] in self?.renderer.placeBlock() }
+        mtkView.onPlaceBlock = { [weak self] in self?.placeOrTrade() }
         renderer.onStatsUpdate = { [weak self] text in self?.debugOverlayView.setText(text) }
         renderer.onHotbarChanged = { [weak self] slots, selectedIndex in
+            guard let self else { return }
             // HotbarView only ever shows the wieldable range — the rest is
             // inventory-only overflow, which InventoryView still gets in full.
-            self?.hotbarView.update(slots: Array(slots.prefix(Hotbar.hotbarSlotCount)), selectedIndex: selectedIndex)
-            self?.inventoryView.update(slots: slots, selectedIndex: selectedIndex)
+            self.hotbarView.update(slots: Array(slots.prefix(Hotbar.hotbarSlotCount)), selectedIndex: selectedIndex)
+            self.inventoryView.update(slots: slots, selectedIndex: selectedIndex, nearCraftingTable: self.renderer.isNearCraftingTable)
         }
         renderer.onBreakProgressChanged = { [weak self] progress in self?.breakProgressView.setProgress(progress) }
+        renderer.onToastMessage = { [weak self] message in self?.toastView.show(message) }
+        renderer.onVitalsChanged = { [weak self] health, maxHealth, hunger, maxHunger in
+            self?.vitalsView.update(health: health, maxHealth: maxHealth, hunger: hunger, maxHunger: maxHunger)
+        }
 
         gameControllerManager = GameControllerManager(inputController: inputController, hotbar: renderer.hotbar, camera: renderer.camera)
         gameControllerManager.onPause = { [weak self] in self?.handleEscape() }
         gameControllerManager.onToggleInventory = { [weak self] in self?.toggleInventory() }
         gameControllerManager.onBreakBlock = { [weak self] in self?.attackOrBreak() }
-        gameControllerManager.onPlaceBlock = { [weak self] in self?.renderer.placeBlock() }
-        renderer.onFrameTick = { [weak self] deltaTime in self?.gameControllerManager.update(deltaTime: deltaTime) }
+        gameControllerManager.onPlaceBlock = { [weak self] in self?.placeOrTrade() }
+        renderer.onFrameTick = { [weak self] deltaTime in
+            self?.gameControllerManager.update(deltaTime: deltaTime)
+            self?.toastView.update(deltaTime: deltaTime)
+        }
 
         window.title = "\(world.name) — WASD walk, mouse to look, Space jump, click to break/place, 1-9/0 hotbar, I inventory/craft, M map, Shift sprint, C camera, H debug"
         window.contentView = mtkView
@@ -237,7 +257,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsMenuView = nil
         debugOverlayView = nil
         hotbarView = nil
+        vitalsView = nil
         breakProgressView = nil
+        toastView = nil
         inventoryView = nil
         mapView = nil
         gameControllerManager = nil
@@ -382,6 +404,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func attackOrBreak() {
         guard !renderer.attackTargetedAnimal() else { return }
         renderer.breakTargetedBlock()
+    }
+
+    /// Right click / controller place-button: trading with a targeted
+    /// villager, then eating the selected item, both take priority over
+    /// placing a block — mirrors attackOrBreak's own priority pattern for
+    /// left click.
+    private func placeOrTrade() {
+        guard !renderer.tradeWithTargetedVillager() else { return }
+        guard !renderer.eatSelectedFood() else { return }
+        renderer.placeBlock()
     }
 
     private func handleEscape() {

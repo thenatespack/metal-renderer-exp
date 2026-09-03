@@ -9,7 +9,8 @@ import QuartzCore
 /// instead, to re-mesh whatever's already loaded around an edit.
 ///
 /// Chunk generation (noise + meshing) is pure CPU work with no shared mutable
-/// state — TerrainGenerator is read-only after init, BlockEdits is its own
+/// state — TerrainGenerator is read-only after init, VillageGenerator is its
+/// own lock-protected cache (see its layoutCache), BlockEdits is its own
 /// lock-protected store, and Chunk's init only touches its own locals plus
 /// MTLDevice, whose resource-creation methods are safe to call concurrently.
 /// So builds run in parallel across cores on a background queue and only hop
@@ -20,6 +21,7 @@ import QuartzCore
 final class ChunkManager {
     private let device: MTLDevice
     private let generator: TerrainGenerator
+    private let villageGenerator: VillageGenerator
     private let blockEdits: BlockEdits
     let chunkSize: Int
     let worldHeight: Int
@@ -52,9 +54,10 @@ final class ChunkManager {
     }
     var pendingChunkCount: Int { pendingCoords.count }
 
-    init(device: MTLDevice, generator: TerrainGenerator, blockEdits: BlockEdits, chunkSize: Int, worldHeight: Int) {
+    init(device: MTLDevice, generator: TerrainGenerator, villageGenerator: VillageGenerator, blockEdits: BlockEdits, chunkSize: Int, worldHeight: Int) {
         self.device = device
         self.generator = generator
+        self.villageGenerator = villageGenerator
         self.blockEdits = blockEdits
         self.chunkSize = chunkSize
         self.worldHeight = worldHeight
@@ -164,9 +167,9 @@ final class ChunkManager {
 
         let size = chunkSize
         let height = worldHeight
-        buildQueue.async { [device, generator, blockEdits] in
+        buildQueue.async { [device, generator, villageGenerator, blockEdits] in
             let start = CACurrentMediaTime()
-            let chunk = Chunk(coord: coord, size: size, worldHeight: height, generator: generator, blockEdits: blockEdits, device: device)
+            let chunk = Chunk(coord: coord, size: size, worldHeight: height, generator: generator, villageGenerator: villageGenerator, blockEdits: blockEdits, device: device)
             let buildSeconds = CACurrentMediaTime() - start
 
             DispatchQueue.main.async { [weak self] in

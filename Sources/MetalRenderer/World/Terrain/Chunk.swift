@@ -32,7 +32,7 @@ final class Chunk {
     let foliage: ChunkGeometry
     let water: ChunkGeometry
 
-    init(coord: ChunkCoord, size: Int, worldHeight: Int, generator: TerrainGenerator, blockEdits: BlockEdits, device: MTLDevice) {
+    init(coord: ChunkCoord, size: Int, worldHeight: Int, generator: TerrainGenerator, villageGenerator: VillageGenerator, blockEdits: BlockEdits, device: MTLDevice) {
         self.coord = coord
 
         let originX = coord.x * size
@@ -56,6 +56,11 @@ final class Chunk {
             zRange: (originZ - 1)...(originZ + size)
         )
 
+        // Resolved once per chunk, not once per voxel — see VillageQuery's
+        // own doc comment for why that distinction matters (this closure
+        // below runs tens of thousands of times per chunk).
+        let villageQuery = villageGenerator.query(chunkOriginX: originX, chunkOriginZ: originZ, chunkSize: size)
+
         func voxelAt(_ x: Int, _ y: Int, _ z: Int) -> VoxelType {
             if y < 0 { return .stone }
             if y >= worldHeight { return .air }
@@ -64,6 +69,9 @@ final class Chunk {
             let worldZ = originZ + z
             if let edited = localEdits[BlockCoord(x: worldX, y: y, z: worldZ)] {
                 return edited
+            }
+            if let village = villageQuery.block(x: worldX, y: y, z: worldZ) {
+                return village
             }
 
             let info = columnTable[(x + 1) + (z + 1) * tableSize]

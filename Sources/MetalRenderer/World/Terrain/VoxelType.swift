@@ -33,6 +33,14 @@ enum VoxelType: UInt8, Codable {
     case rawPork
     case rawMutton
     case rawChicken
+    // Crafted-only, same as planks/stoneBricks above — a real solid/placeable
+    // block (not a tool/item like map or the meats), gates a second crafting
+    // tier by proximity (see CraftingRecipe.requiresCraftingTable and
+    // Renderer.isNearCraftingTable). Appended at the end, not sorted in with
+    // the other crafted blocks above, so every existing case keeps its raw
+    // UInt8 value — this enum's raw value is what block edits are saved as
+    // (see BlockEdits/WorldStore), and reordering would corrupt old saves.
+    case craftingTable
 
     private static let nonSolidTypes: Set<VoxelType> = [.air, .map, .bone, .rawPork, .rawMutton, .rawChicken]
     var isSolid: Bool { !Self.nonSolidTypes.contains(self) }
@@ -62,6 +70,7 @@ enum VoxelType: UInt8, Codable {
         case .rawPork:           return SIMD3<Float>(0.88, 0.58, 0.58)
         case .rawMutton:         return SIMD3<Float>(0.78, 0.38, 0.40)
         case .rawChicken:        return SIMD3<Float>(0.92, 0.72, 0.68)
+        case .craftingTable:     return SIMD3<Float>(0.44, 0.30, 0.16)
         }
     }
 
@@ -71,7 +80,7 @@ enum VoxelType: UInt8, Codable {
     var breakDuration: Float {
         switch self {
         case .stone, .stoneBricks, .polishedStone: return 1.2
-        case .wood, .planks, .reinforcedPlanks: return 0.8
+        case .wood, .planks, .reinforcedPlanks, .craftingTable: return 0.8
         case .leaves, .thatch: return 0.25
         case .grass, .dirt, .sand, .snow, .mudBricks, .packedSnow, .sandstone, .packedDirt: return 0.4
         case .air, .water, .map, .bone, .rawPork, .rawMutton, .rawChicken: return 0.4
@@ -104,6 +113,7 @@ enum VoxelType: UInt8, Codable {
         case .rawPork:           return "Raw Pork"
         case .rawMutton:         return "Raw Mutton"
         case .rawChicken:        return "Raw Chicken"
+        case .craftingTable:     return "Crafting Table"
         }
     }
 }

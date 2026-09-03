@@ -42,10 +42,12 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let blockAt: (Int, Int, Int) -> VoxelType
     private let groundHeight: (Float, Float) -> Float
     private let animalManager: AnimalManager
+    private let villagerManager: VillagerManager
     // Stateless/pure — see TerrainGenerator's own doc comment — so MapView's
     // one-time snapshot (see terrainColor) can call it freely off to the side
     // of the normal chunk-building path.
     private let terrainGenerator: TerrainGenerator
+    private let villageGenerator: VillageGenerator
     private let blockEdits = BlockEdits()
     private let worldID: UUID
     // Serial so overlapping saves (rapid-fire breaking/placing) don't race
@@ -55,6 +57,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     private(set) var gameMode: GameMode = .creative
     private var lastFrameTime = CACurrentMediaTime()
     private var elapsedTime: Float = 0
+
+    let playerVitals: PlayerVitals
+    /// Where the player respawns on death — the same spawn point used at
+    /// world creation, not wherever they last were.
+    private let spawnPosition: SIMD3<Float>
+    // Only actually hits disk when health/hunger changed since the last
+    // write (see updatePlayerVitals) — every-frame equality checks are far
+    // cheaper than every-frame disk writes.
+    private var lastPersistedHealth: Int
+    private var lastPersistedHunger: Int
+    /// Recomputed every frame (see draw(in:)) by scanning near the player via
+    /// blockAt — cheap, and matches isCameraUnderwater/daylightFactor's own
+    /// per-frame-recompute style rather than caching off an edit event.
+    private(set) var isNearCraftingTable = false
+    private static let craftingTableSearchRadius = 3
 
     // Survival breaking: which block (if any) is currently being chipped
     // away, and how far along. Reset whenever the target changes, the mouse
@@ -90,6 +107,12 @@ final class Renderer: NSObject, MTKViewDelegate {
     /// AppDelegate drive GameControllerManager's per-frame stick polling
     /// without Renderer needing to import GameController/AppKit itself.
     var onFrameTick: ((Float) -> Void)?
+    /// Called with a short message whenever a villager trade succeeds or
+    /// fails (see tradeWithTargetedVillager), for ToastView to display.
+    var onToastMessage: ((String) -> Void)?
+    /// Called every frame with (health, maxHealth, hunger, maxHunger), for
+    /// VitalsView to display.
+    var onVitalsChanged: ((Int, Int, Int, Int) -> Void)?
 
     private var aspectRatio: Float = 1
 
@@ -258,9 +281,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         // this just replays the edits on top before anything else touches
         // blockEdits/generator.
         let generator = TerrainGenerator(seed: world.seed, worldHeight: worldHeight)
+        let villageGenerator = VillageGenerator(seed: world.seed, terrainGenerator: generator)
         let blockEdits = self.blockEdits
         blockEdits.load(WorldStore.loadEdits(for: world.id))
-        self.chunkManager = ChunkManager(device: device, generator: generator, blockEdits: blockEdits, chunkSize: chunkSize, worldHeight: worldHeight)
+        self.chunkManager = ChunkManager(device: device, generator: generator, villageGenerator: villageGenerator, blockEdits: blockEdits, chunkSize: chunkSize, worldHeight: worldHeight)
 
         for _ in 0..<maxBuffersInFlight {
             guard let buffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: .storageModeShared) else {
@@ -277,6 +301,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         func blockAt(_ x: Int, _ y: Int, _ z: Int) -> VoxelType {
             if let edited = blockEdits.get(BlockCoord(x: x, y: y, z: z)) {
                 return edited
+            }
+            if let village = villageGenerator.block(x: x, y: y, z: z) {
+                return village
             }
             return generator.proceduralBlock(x: x, y: y, z: z, worldHeight: worldHeight)
         }
@@ -309,12 +336,27 @@ final class Renderer: NSObject, MTKViewDelegate {
         let groundHeight: (Float, Float) -> Float = { x, z in
             let ix = Int(x.rounded(.down))
             let iz = Int(z.rounded(.down))
-            let proceduralHeight = generator.columnInfo(x: ix, z: iz).height
+            // A village flattens/replaces terrain across its whole footprint
+            // (see VillageGenerator), so its surface height can't be derived
+            // from TerrainGenerator's own (unmodified) column height — use it
+            // as this column's base height instead, the same role
+            // proceduralHeight plays outside a village. This must NOT skip
+            // the edit-aware slow path below when there IS a player edit
+            // here — a village column can be dug into or built on exactly
+            // like any other, and the fast path returning a fixed height
+            // regardless would silently ignore that (the mesh still shows
+            // the edit correctly, since Chunk/blockAt check edits first, but
+            // physics would float/clip through it).
+            let villageHeight = villageGenerator.flattenedHeight(x: ix, z: iz)
+            let baseHeight = villageHeight ?? generator.columnInfo(x: ix, z: iz).height
             let editRange = blockEdits.editedYRange(x: ix, z: iz)
-            if editRange == nil, !generator.isCarved(x: ix, y: proceduralHeight, z: iz, surfaceHeight: proceduralHeight) {
-                return Float(proceduralHeight + 1)
+            // Villages are never carved (their own eligibility check already
+            // rejects cave/ravine sites), so isCarved only needs checking in
+            // the natural-terrain case.
+            if editRange == nil, villageHeight != nil || !generator.isCarved(x: ix, y: baseHeight, z: iz, surfaceHeight: baseHeight) {
+                return Float(baseHeight + 1)
             }
-            var y = max(proceduralHeight, editRange?.upperBound ?? proceduralHeight) + 1
+            var y = max(baseHeight, editRange?.upperBound ?? baseHeight) + 1
             while y >= 0 {
                 if isObstacle(blockAt(ix, y, iz)) { return Float(y + 1) }
                 y -= 1
@@ -395,15 +437,22 @@ final class Renderer: NSObject, MTKViewDelegate {
             isSolidAt: isSolidAt
         )
         camera.position.y = spawnHeight + playerController.eyeHeight
+        self.spawnPosition = camera.position
         self.playerController = playerController
+        let playerVitals = PlayerVitals(health: world.health, hunger: world.hunger)
+        self.playerVitals = playerVitals
+        self.lastPersistedHealth = playerVitals.health
+        self.lastPersistedHunger = playerVitals.hunger
         self.isSolidAt = isSolidAt
         self.waterSurfaceHeight = waterSurfaceHeight
         self.blockAt = blockAt
         self.groundHeight = groundHeight
         self.terrainGenerator = generator
+        self.villageGenerator = villageGenerator
         self.worldID = world.id
         self.hotbar = Hotbar(gameMode: .creative)
-        self.animalManager = AnimalManager(terrainGenerator: generator, groundHeight: groundHeight, waterSurfaceHeight: waterSurfaceHeight)
+        self.animalManager = AnimalManager(terrainGenerator: generator, villageGenerator: villageGenerator, groundHeight: groundHeight, waterSurfaceHeight: waterSurfaceHeight)
+        self.villagerManager = VillagerManager(villageGenerator: villageGenerator, groundHeight: groundHeight, waterSurfaceHeight: waterSurfaceHeight)
 
         super.init()
     }
@@ -500,9 +549,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             for deadAnimal in animalManager.removeDeadAnimals() {
                 spawnAnimalDrops(for: deadAnimal)
             }
+            villagerManager.update(around: camera.position, deltaTime: deltaTime)
+            updatePlayerVitals(deltaTime: deltaTime)
         }
+        updateCraftingTableProximity()
         onHotbarChanged?(hotbar.slots, hotbar.selectedIndex)
         onBreakProgressChanged?(breakingProgress)
+        onVitalsChanged?(playerVitals.health, PlayerVitals.maxHealth, playerVitals.hunger, PlayerVitals.maxHunger)
         chunkManager.update(around: camera.position)
         logBenchmark(deltaTime: deltaTime)
 
@@ -610,6 +663,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         // lit cubes like anything else, just rebuilt fresh each frame.
         drawDroppedItems(with: encoder)
         drawAnimals(with: encoder)
+        drawVillagers(with: encoder)
 
         // Foliage: same opaque depth state as terrain (it writes depth, no
         // blending), just a different vertex function for the wind sway.
@@ -755,13 +809,76 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Fire-and-forget, mirrors persistSave — called only when health/hunger
+    /// actually changed (see updatePlayerVitals), not every frame, since
+    /// that would mean a disk write per frame while starving/regenerating.
+    private func persistVitals() {
+        let health = playerVitals.health
+        let hunger = playerVitals.hunger
+        saveQueue.async { [worldID] in
+            WorldStore.saveVitals(health: health, hunger: hunger, for: worldID)
+        }
+    }
+
     /// Blocking variant for app shutdown/quit-to-title (see AppDelegate) —
     /// there's no next frame to let an async persistSave finish on, so this
     /// waits on saveQueue instead of just enqueueing onto it.
     func saveNow() {
+        let health = playerVitals.health
+        let hunger = playerVitals.hunger
         saveQueue.sync { [worldID, blockEdits] in
             WorldStore.saveEdits(blockEdits.allEdits(), for: worldID)
+            WorldStore.saveVitals(health: health, hunger: hunger, for: worldID)
         }
+    }
+
+    /// Survival-only (creative players are invincible/never hungry, matching
+    /// how creative already skips break-progress and gives infinite items).
+    /// fallDamage is derived here from PlayerController's landing state
+    /// rather than inside PlayerVitals, since only Renderer knows the
+    /// block-scale safe-fall threshold that turns a fall distance into damage.
+    private func updatePlayerVitals(deltaTime: Float) {
+        guard gameMode == .survival else { return }
+
+        var fallDamage = 0
+        if playerController.justLanded, playerController.lastFallDistance > PlayerVitals.safeFallDistance {
+            let excessBlocks = Int((playerController.lastFallDistance - PlayerVitals.safeFallDistance).rounded(.up))
+            fallDamage = excessBlocks * PlayerVitals.fallDamagePerBlock
+        }
+        playerVitals.update(deltaTime: deltaTime, fallDamage: fallDamage)
+
+        if playerVitals.health != lastPersistedHealth || playerVitals.hunger != lastPersistedHunger {
+            lastPersistedHealth = playerVitals.health
+            lastPersistedHunger = playerVitals.hunger
+            persistVitals()
+        }
+
+        if playerVitals.isDead {
+            camera.position = spawnPosition
+            playerVitals.respawn()
+            onToastMessage?("You died")
+        }
+    }
+
+    /// Recomputed every frame (see draw(in:)) rather than only while the
+    /// inventory is open — cheap (a few dozen blockAt calls), and simpler
+    /// than threading an "inventory just opened" event down to Renderer.
+    private func updateCraftingTableProximity() {
+        let feetX = Int(camera.position.x.rounded())
+        let feetY = Int((camera.position.y - playerController.eyeHeight).rounded())
+        let feetZ = Int(camera.position.z.rounded())
+        let radius = Self.craftingTableSearchRadius
+        for dy in -2...2 {
+            for dz in -radius...radius {
+                for dx in -radius...radius {
+                    if blockAt(feetX + dx, feetY + dy, feetZ + dz) == .craftingTable {
+                        isNearCraftingTable = true
+                        return
+                    }
+                }
+            }
+        }
+        isNearCraftingTable = false
     }
 
     /// Settings-menu hook: keeps unloadRadius a couple chunks past loadRadius
@@ -841,6 +958,69 @@ final class Renderer: NSObject, MTKViewDelegate {
         let away = SIMD2<Float>(animal.position.x - camera.position.x, animal.position.z - camera.position.z)
         let awayLength = length(away)
         animal.hit(awayFromPlayer: awayLength > 0.0001 ? away / awayLength : SIMD2<Float>(0, 1))
+        return true
+    }
+
+    /// Nearest villager roughly along the camera's look direction within
+    /// reach — same closest-point-to-ray shape as targetedAnimal, just
+    /// against villagerManager.villagers.
+    private func targetedVillager() -> Villager? {
+        let origin = camera.position
+        let direction = camera.front
+        var best: Villager?
+        var bestDistance = animalHitReach
+        for villager in villagerManager.villagers {
+            let bodyCenter = villager.position + SIMD3<Float>(0, 0.6, 0)
+            let toVillager = bodyCenter - origin
+            let alongRay = dot(toVillager, direction)
+            guard alongRay > 0, alongRay < bestDistance else { continue }
+            let closestPoint = origin + direction * alongRay
+            guard length(bodyCenter - closestPoint) < animalHitRadius else { continue }
+            bestDistance = alongRay
+            best = villager
+        }
+        return best
+    }
+
+    /// Right click, tried before placeBlock — mirrors attackTargetedAnimal's
+    /// priority pattern for left click. Executes the targeted villager's
+    /// fixed trade immediately if the player has enough of what it wants,
+    /// otherwise just reports what's missing. Returns whether a villager was
+    /// targeted at all (trade attempted, successful or not), so the caller
+    /// knows not to also place a block this click.
+    @discardableResult
+    func tradeWithTargetedVillager() -> Bool {
+        guard !isPaused, let villager = targetedVillager() else { return false }
+        let recipe = villager.tradeRecipe
+        guard hotbar.count(of: recipe.give.type) >= recipe.give.count else {
+            onToastMessage?("Need \(recipe.give.count) \(recipe.give.type.displayName)")
+            return true
+        }
+        // A slot already holding this type always has room (no per-slot
+        // stack cap — see Hotbar.addItem); otherwise there needs to be an
+        // empty slot free. Checked before removing anything the player pays,
+        // so a full hotbar can't eat the payment for nothing in return.
+        let hasRoom = hotbar.slots.contains { $0.type == recipe.receive.type } || hotbar.slots.contains { $0.type == nil }
+        guard hasRoom else {
+            onToastMessage?("No room for \(recipe.receive.type.displayName)")
+            return true
+        }
+        hotbar.remove(recipe.give.type, count: recipe.give.count)
+        hotbar.addItems(recipe.receive.type, count: recipe.receive.count)
+        onToastMessage?("Traded for \(recipe.receive.count) \(recipe.receive.type.displayName)")
+        return true
+    }
+
+    /// Right click, tried before placeBlock (after tradeWithTargetedVillager)
+    /// — same priority-chain pattern. Only the selected slot's held item can
+    /// be eaten, no separate "eat" input. Creative doesn't need food at all,
+    /// so this only ever does something in survival. Returns whether eating
+    /// was attempted at all, so the caller knows not to also place a block.
+    @discardableResult
+    func eatSelectedFood() -> Bool {
+        guard !isPaused, gameMode == .survival, let selectedType = hotbar.selectedType,
+              playerVitals.eat(selectedType) else { return false }
+        hotbar.consumeSelected()
         return true
     }
 
@@ -999,8 +1179,11 @@ final class Renderer: NSObject, MTKViewDelegate {
             let dx = item.position.x - feetPosition.x
             let dy = item.position.y - feetPosition.y
             let dz = item.position.z - feetPosition.z
-            if dx * dx + dy * dy + dz * dz < pickupRadiusSq {
-                hotbar.addItem(item.type)
+            // Only actually consumed if the hotbar had room — addItem
+            // returns false when every slot is full of some other type, and
+            // an item that couldn't be picked up should stay on the ground
+            // (and remain eligible for despawn below) rather than vanishing.
+            if dx * dx + dy * dy + dz * dz < pickupRadiusSq, hotbar.addItem(item.type) {
                 continue
             }
             if now - item.spawnTime > itemDespawnSeconds {
@@ -1048,6 +1231,26 @@ final class Renderer: NSObject, MTKViewDelegate {
             let start = UInt32(vertices.count)
             vertices.append(contentsOf: animalVertices)
             indices.append(contentsOf: animalIndices.map { $0 + start })
+        }
+        guard let vertexBuffer = device.makeBuffer(bytes: vertices, length: MemoryLayout<Vertex>.stride * vertices.count, options: .storageModeShared),
+              let indexBuffer = device.makeBuffer(bytes: indices, length: MemoryLayout<UInt32>.stride * indices.count, options: .storageModeShared) else {
+            return
+        }
+        draw(ChunkGeometry(vertexBuffer: vertexBuffer, indexBuffer: indexBuffer, indexCount: indices.count), with: encoder)
+    }
+
+    private func drawVillagers(with encoder: MTLRenderCommandEncoder) {
+        let villagers = villagerManager.villagers
+        guard !villagers.isEmpty else { return }
+        var vertices: [Vertex] = []
+        var indices: [UInt32] = []
+        for villager in villagers {
+            let (villagerVertices, villagerIndices) = VillagerMesh.buildMesh(
+                feetPosition: villager.position, yaw: villager.yaw, walkBobPhase: villager.walkBobPhase
+            )
+            let start = UInt32(vertices.count)
+            vertices.append(contentsOf: villagerVertices)
+            indices.append(contentsOf: villagerIndices.map { $0 + start })
         }
         guard let vertexBuffer = device.makeBuffer(bytes: vertices, length: MemoryLayout<Vertex>.stride * vertices.count, options: .storageModeShared),
               let indexBuffer = device.makeBuffer(bytes: indices, length: MemoryLayout<UInt32>.stride * indices.count, options: .storageModeShared) else {

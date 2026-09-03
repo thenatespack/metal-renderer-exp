@@ -7,6 +7,7 @@ import simd
 /// do inline on the main thread).
 final class AnimalManager {
     private let terrainGenerator: TerrainGenerator
+    private let villageGenerator: VillageGenerator
     private let groundHeight: (Float, Float) -> Float
     private let waterSurfaceHeight: (Float, Float) -> Float?
 
@@ -19,8 +20,9 @@ final class AnimalManager {
     private let spawnInterval: Float = 1.5
     private var spawnCooldown: Float = 0
 
-    init(terrainGenerator: TerrainGenerator, groundHeight: @escaping (Float, Float) -> Float, waterSurfaceHeight: @escaping (Float, Float) -> Float?) {
+    init(terrainGenerator: TerrainGenerator, villageGenerator: VillageGenerator, groundHeight: @escaping (Float, Float) -> Float, waterSurfaceHeight: @escaping (Float, Float) -> Float?) {
         self.terrainGenerator = terrainGenerator
+        self.villageGenerator = villageGenerator
         self.groundHeight = groundHeight
         self.waterSurfaceHeight = waterSurfaceHeight
     }
@@ -80,8 +82,15 @@ final class AnimalManager {
         // Grass only (matches plains/taiga/forest — see Biome), and not a
         // cave/ravine mouth (see TerrainGenerator.isCarved, same check
         // Renderer's own spawn-column search uses) — an animal materializing
-        // over an open pit would just fall right in.
-        guard info.topBlock == .grass, !terrainGenerator.isCarved(x: ix, y: info.height, z: iz, surfaceHeight: info.height) else { return }
+        // over an open pit would just fall right in. Also not inside a
+        // village footprint (see VillageGenerator) — that column's real
+        // topBlock is whatever the village put there (a floor, a wall, open
+        // yard dirt), not this raw terrain check, and an animal has no
+        // business wandering into someone's house either way.
+        guard info.topBlock == .grass,
+              !terrainGenerator.isCarved(x: ix, y: info.height, z: iz, surfaceHeight: info.height),
+              villageGenerator.flattenedHeight(x: ix, z: iz) == nil
+        else { return }
 
         let type = AnimalType.allCases.randomElement() ?? .pig
         let position = SIMD3<Float>(Float(ix) + 0.5, Float(info.height + 1), Float(iz) + 0.5)

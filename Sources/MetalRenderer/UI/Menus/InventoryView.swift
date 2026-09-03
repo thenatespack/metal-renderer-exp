@@ -28,6 +28,11 @@ final class InventoryView: NSView, ControllerMenuNavigable {
     private var slots: [HotbarSlot] = []
     private var selectedIndex = 0
     private var focusedRecipeIndex = 0
+    // Set every frame from Renderer.isNearCraftingTable — see update(...).
+    // Distinct from a recipe's own hotbar.hasIngredients check: a tier-2
+    // recipe can be both affordable and table-locked at once, and the two
+    // reasons are drawn differently (see drawRecipeBook).
+    private var nearCraftingTable = false
 
     private var hotbarSlotRects: [CGRect] = []
     private var gridCellRects: [CGRect] = []
@@ -80,10 +85,19 @@ final class InventoryView: NSView, ControllerMenuNavigable {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func update(slots: [HotbarSlot], selectedIndex: Int) {
+    func update(slots: [HotbarSlot], selectedIndex: Int, nearCraftingTable: Bool) {
         self.slots = slots
         self.selectedIndex = selectedIndex
+        self.nearCraftingTable = nearCraftingTable
         needsDisplay = true
+    }
+
+    /// A recipe locked because no crafting table is nearby — distinct from
+    /// hotbar.hasIngredients' "missing materials" lock, so callers (fillGrid,
+    /// drawRecipeBook) can tell the two reasons apart instead of treating
+    /// every locked recipe the same.
+    private func isTableLocked(_ recipe: CraftingRecipe) -> Bool {
+        recipe.requiresCraftingTable && !nearCraftingTable
     }
 
     // MARK: Mouse interaction
@@ -169,6 +183,7 @@ final class InventoryView: NSView, ControllerMenuNavigable {
     /// bulkFillCap, so right-clicking in creative (infinite materials)
     /// doesn't try to stack an unbounded amount into 9 cells.
     private func fillGrid(with recipe: CraftingRecipe, batches: Int) {
+        guard !isTableLocked(recipe) else { return }
         let affordable = recipe.ingredients.map { hotbar.count(of: $0.type) / $0.count }.min() ?? 0
         let actualBatches = min(batches, affordable, Self.bulkFillCap)
         guard actualBatches > 0 else { return }
@@ -408,10 +423,18 @@ final class InventoryView: NSView, ControllerMenuNavigable {
             recipeCellRects[index] = rect
 
             let available = hotbar.hasIngredients(for: recipe)
-            context.setFillColor(NSColor.black.withAlphaComponent(available ? 0.55 : 0.3).cgColor)
+            let tableLocked = isTableLocked(recipe)
+            context.setFillColor(NSColor.black.withAlphaComponent(available && !tableLocked ? 0.55 : 0.3).cgColor)
             context.fill(rect.insetBy(dx: -3, dy: -3))
-            fillSwatch(recipe.resultType, in: rect, context: context, dimmed: !available)
+            fillSwatch(recipe.resultType, in: rect, context: context, dimmed: !available || tableLocked)
             drawCount("x\(recipe.resultCount)", in: rect, context: context)
+            // Table-locked gets its own tint (blue) distinct from a plain
+            // missing-ingredients dim, so the two lock reasons read differently.
+            if tableLocked {
+                context.setStrokeColor(NSColor(calibratedRed: 0.4, green: 0.6, blue: 0.95, alpha: 0.9).cgColor)
+                context.setLineWidth(2)
+                context.stroke(rect.insetBy(dx: -1, dy: -1))
+            }
 
             if index == focusedRecipeIndex {
                 context.setStrokeColor(NSColor.white.cgColor)
@@ -432,6 +455,13 @@ final class InventoryView: NSView, ControllerMenuNavigable {
         let needsAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.white.withAlphaComponent(0.85)]
         let needsText = "Needs: \(ingredientsList)" as NSString
         needsText.draw(at: NSPoint(x: panel.midX - needsText.size(withAttributes: needsAttrs).width / 2, y: top - 18), withAttributes: needsAttrs)
+
+        guard recipe.requiresCraftingTable else { return }
+        let tableLocked = isTableLocked(recipe)
+        let tableColor = tableLocked ? NSColor(calibratedRed: 0.4, green: 0.6, blue: 0.95, alpha: 1) : NSColor.white.withAlphaComponent(0.85)
+        let tableAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: tableColor]
+        let tableText = "Requires: Crafting Table (nearby)" as NSString
+        tableText.draw(at: NSPoint(x: panel.midX - tableText.size(withAttributes: tableAttrs).width / 2, y: top - 36), withAttributes: tableAttrs)
     }
 
     private func drawFloatingDrag(context: CGContext) {

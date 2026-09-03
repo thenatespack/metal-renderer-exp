@@ -49,11 +49,13 @@ enum WorldStore {
         }
     }
 
-    /// Creates a new world with a fresh random seed and no edits yet.
+    /// Creates a new world with no edits yet. `seed` defaults to a fresh
+    /// random one (MainMenuView's seed field is optional, random when left
+    /// blank) but can be pinned to reproduce a specific world.
     @discardableResult
-    static func createWorld(name: String) -> WorldMeta {
+    static func createWorld(name: String, seed: UInt64? = nil) -> WorldMeta {
         let now = Date()
-        let meta = WorldMeta(id: UUID(), name: name, seed: UInt64.random(in: 0...UInt64.max), createdAt: now, lastPlayedAt: now)
+        let meta = WorldMeta(id: UUID(), name: name, seed: seed ?? UInt64.random(in: 0...UInt64.max), createdAt: now, lastPlayedAt: now)
         writeMeta(meta)
         saveEdits([:], for: meta.id)
         return meta
@@ -67,6 +69,17 @@ enum WorldStore {
         meta.lastPlayedAt = Date()
         writeMeta(meta)
         return meta
+    }
+
+    /// Called whenever PlayerVitals' health/hunger actually changes (see
+    /// Renderer.persistVitals/saveNow) — same read-mutate-write shape as
+    /// touchLastPlayed, since vitals live on the same small WorldMeta record
+    /// rather than their own file.
+    static func saveVitals(health: Int, hunger: Int, for id: UUID) {
+        guard var meta = readMeta(id) else { return }
+        meta.health = health
+        meta.hunger = hunger
+        writeMeta(meta)
     }
 
     static func loadEdits(for id: UUID) -> [BlockCoord: VoxelType] {
